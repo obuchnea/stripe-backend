@@ -1,1 +1,1 @@
-worker: node scheduler.js
+web: node server.js
