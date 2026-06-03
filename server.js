@@ -172,8 +172,8 @@ const PORT = process.env.PORT || 3000;
 const cron = require('node-cron');
 const { run } = require('./sync');
 
-// Runs every night at 2am UTC
-cron.schedule('0 2 * * *', async () => {
+// Runs every night at 11:59pm EDT (3:59am UTC)
+cron.schedule('59 3 * * *', async () => {
   console.log('[cron] Starting nightly sync...');
   await run().catch(err => console.error('[cron] Sync failed:', err.message));
 });
