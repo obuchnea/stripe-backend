@@ -319,10 +319,12 @@ async function ensureSheetHeader(sheets) {
  * Append one summary row to the Google Sheet.
  *
  * @param {object} summary
- * @param {string} summary.date            — YYYY-MM-DD
- * @param {number} summary.dailyTotal      — total $ donated in this sync window
- * @param {number} summary.dailyDonorCount — total transaction count in this sync window
- * @param {number} summary.newDonorCount   — contacts created (first-ever donation)
+ * @param {string}  summary.date            — YYYY-MM-DD
+ * @param {number}  summary.dailyTotal      — total $ donated in this sync window
+ * @param {number}  summary.dailyDonorCount — unique donor count in this sync window
+ * @param {number}  summary.newDonorCount   — contacts created (first-ever donation)
+ * @param {boolean} summary.isFullSync      — if true, treat totals as all-time baselines
+ *                                            rather than adding to previous sheet values
  */
 async function appendSheetRow(summary) {
   const sheetId = process.env.GOOGLE_SHEET_ID;
@@ -343,8 +345,20 @@ async function appendSheetRow(summary) {
 
   const { cumulativeTotal, cumulativeDonors } = await getLastCumulativeTotals(sheets);
 
-  const newCumulativeTotal   = parseFloat((cumulativeTotal   + summary.dailyTotal).toFixed(2));
-  const newCumulativeDonors  = cumulativeDonors + summary.newDonorCount;
+  let newCumulativeTotal;
+  let newCumulativeDonors;
+
+  if (summary.isFullSync) {
+    // On a full sync the "daily" figures already represent all-time totals.
+    // Write them directly as the cumulative baseline instead of adding to
+    // whatever (potentially stale) values were already in the sheet.
+    newCumulativeTotal  = summary.dailyTotal;
+    newCumulativeDonors = summary.dailyDonorCount;
+  } else {
+    // Incremental run — add today's activity on top of the previous cumulative row.
+    newCumulativeTotal  = parseFloat((cumulativeTotal + summary.dailyTotal).toFixed(2));
+    newCumulativeDonors = cumulativeDonors + summary.newDonorCount;
+  }
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: sheetId,
@@ -362,7 +376,7 @@ async function appendSheetRow(summary) {
     },
   });
 
-  console.log(`[sheets] Row appended → ${summary.date} | $${summary.dailyTotal.toFixed(2)} | ${summary.dailyDonorCount} transactions | ${summary.newDonorCount} new donors | cumulative $${newCumulativeTotal.toFixed(2)} across ${newCumulativeDonors} donors`);
+  console.log(`[sheets] Row appended → ${summary.date} | $${summary.dailyTotal.toFixed(2)} | ${summary.dailyDonorCount} donors | ${summary.newDonorCount} new donors | cumulative $${newCumulativeTotal.toFixed(2)} across ${newCumulativeDonors} donors`);
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -394,12 +408,14 @@ async function run() {
     console.log('[sync] Nothing to do.');
     saveLastSyncTimestamp(runTimestamp);
 
-    // Still write a zero-row to the sheet so every day has a record
+    // Still write a zero-row to the sheet so every day has a record.
+    // A zero-row is never a full sync baseline, so isFullSync: false is correct here.
     await appendSheetRow({
       date:            rowDate,
       dailyTotal:      0,
       dailyDonorCount: 0,
       newDonorCount:   0,
+      isFullSync:      false,
     });
 
     return { created: 0, updated: 0, failed: 0 };
@@ -444,12 +460,14 @@ async function run() {
   console.log(`  Failed:  ${failed}`);
   console.log(`────────────────────────────────────────\n`);
 
-  // Append daily summary to Google Sheet (skipped gracefully if env vars absent)
+  // On a full sync, treat all processed donors as the all-time baseline.
+  // On an incremental run, only newly created contacts count as "new donors".
   await appendSheetRow({
     date:            rowDate,
     dailyTotal,
     dailyDonorCount: donorMap.size,
-    newDonorCount:   created,   // "created" contacts are first-time donors
+    newDonorCount:   isFullSync ? donorMap.size : created,
+    isFullSync,
   });
 
   return { created, updated, failed };
