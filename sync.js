@@ -8,6 +8,20 @@
  *
  *   Date | Daily Total ($) | Daily Donor Count | New Donors | Cumulative Total ($) | Cumulative Donors
  *
+ * HOW CUMULATIVE DONORS IS CALCULATED:
+ *   Stripe is the sole source of truth for donor identity. A donor is counted
+ *   as "new" on the first calendar day their email appears in Stripe — regardless
+ *   of whether they already exist in HubSpot. The running set of all-time seen
+ *   emails is rebuilt from the full Stripe charge history on every run, so the
+ *   cumulative count is always accurate and self-healing.
+ *
+ *   On a normal nightly run:
+ *     1. All charges ever (up to yesterday) are fetched to build the historical
+ *        seen-email set. This is cheap — Stripe paginates fast.
+ *     2. Yesterday's donors are checked against that set. Emails not seen before
+ *        yesterday count as new cumulative donors.
+ *     3. cumulativeDonors = last sheet row's value + new donors from step 2.
+ *
  * No .last_sync file is used — the time window is always deterministic
  * (yesterday), so every run is idempotent and self-contained.
  *
@@ -18,6 +32,8 @@
  *     2. Groups them by calendar date (UTC).
  *     3. Upserts HubSpot contacts for every donor, day by day in order.
  *     4. Writes one sheet row per calendar date, building a complete history.
+ *        Cumulative donors is computed by walking a running email set in
+ *        chronological order — purely from Stripe data.
  *   After backfill completes, the sheet is fully up to date and subsequent
  *   nightly runs continue normally from yesterday onward.
  *
@@ -114,17 +130,6 @@ function resolveSyncDate() {
   return val;
 }
 
-/**
- * Given a list of all charges, return a sorted array of unique YYYY-MM-DD
- * date strings (UTC) that appear in the data.
- */
-function extractSortedDates(charges) {
-  const dateSet = new Set(
-    charges.map((c) => new Date(c.created * 1000).toISOString().split('T')[0])
-  );
-  return [...dateSet].sort();
-}
-
 // ─── Stripe ────────────────────────────────────────────────────────────────
 
 /**
@@ -152,13 +157,14 @@ async function fetchChargesForDay(stripe, windowStart, windowEnd) {
 
 /**
  * Fetch every succeeded charge in the Stripe account (no date filter).
- * Used only during a full historical backfill.
+ * Used during full historical backfill, and also on normal nightly runs to
+ * build the all-time seen-email set for accurate cumulative donor counting.
  */
-async function fetchAllCharges(stripe) {
+async function fetchAllCharges(stripe, { silent = false } = {}) {
   const charges = [];
   let startingAfter;
 
-  console.log('[backfill] Fetching all Stripe charges (this may take a moment)...');
+  if (!silent) console.log('[stripe] Fetching all charges to build cumulative donor baseline...');
 
   do {
     const params = { limit: 100 };
@@ -168,11 +174,10 @@ async function fetchAllCharges(stripe) {
     charges.push(...page.data.filter((c) => c.status === 'succeeded'));
     startingAfter = page.has_more ? page.data.at(-1).id : undefined;
 
-    process.stdout.write(`\r[backfill] ${charges.length} charges fetched so far...`);
+    if (!silent) process.stdout.write(`\r[stripe] ${charges.length} charges fetched so far...`);
   } while (startingAfter);
 
-  process.stdout.write('\n');
-  console.log(`[backfill] Done — ${charges.length} total succeeded charges.`);
+  if (!silent) process.stdout.write('\n');
   return charges;
 }
 
@@ -184,6 +189,26 @@ function isValidEmail(email) {
 }
 
 /**
+ * Extract a normalised email from a Stripe charge, or return null.
+ */
+function emailFromCharge(charge) {
+  const raw = (
+    charge.billing_details?.email ||
+    charge.receipt_email ||
+    ''
+  ).toLowerCase().trim();
+
+  if (!raw) return null;
+
+  if (!isValidEmail(raw)) {
+    console.warn(`[sync] Skipping malformed email on charge ${charge.id}: "${raw}"`);
+    return null;
+  }
+
+  return raw;
+}
+
+/**
  * Group a set of charges by email.
  * Returns Map<email, { totalAmount, latestCreated, latestAmount, cardName }>
  */
@@ -191,18 +216,8 @@ function buildDonorMap(charges) {
   const donors = new Map();
 
   for (const charge of charges) {
-    const email = (
-      charge.billing_details?.email ||
-      charge.receipt_email ||
-      ''
-    ).toLowerCase().trim();
-
+    const email = emailFromCharge(charge);
     if (!email) continue;
-
-    if (!isValidEmail(email)) {
-      console.warn(`[sync] Skipping malformed email on charge ${charge.id}: "${email}"`);
-      continue;
-    }
 
     const amount   = charge.amount / 100;
     const created  = charge.created;
@@ -227,6 +242,27 @@ function buildDonorMap(charges) {
   }
 
   return donors;
+}
+
+/**
+ * Build a Set of all donor emails from charges that occurred strictly BEFORE
+ * the given dateString (YYYY-MM-DD). Used to determine which of today's donors
+ * are genuinely new (first-ever donation) vs. returning donors.
+ *
+ * @param {Array}  allCharges  — full Stripe charge history (pre-fetched)
+ * @param {string} beforeDate  — YYYY-MM-DD; exclude charges on or after this date
+ * @returns {Set<string>}
+ */
+function buildHistoricalEmailSet(allCharges, beforeDate) {
+  const seen = new Set();
+  for (const charge of allCharges) {
+    const chargeDate = new Date(charge.created * 1000).toISOString().split('T')[0];
+    if (chargeDate < beforeDate) {
+      const email = emailFromCharge(charge);
+      if (email) seen.add(email);
+    }
+  }
+  return seen;
 }
 
 // ─── HubSpot ───────────────────────────────────────────────────────────────
@@ -316,7 +352,6 @@ async function isSheetEmpty(sheets) {
     range: `${SHEET_TAB}!A:A`,
   });
   const rows = res.data.values || [];
-  // rows[0] would be the header; if length <= 1 there are no data rows
   return rows.length <= 1;
 }
 
@@ -369,19 +404,28 @@ async function ensureSheetHeader(sheets) {
 
 /**
  * Append one summary row for the given date.
- * Reads the current cumulative totals from the sheet and increments them.
  *
- * @param {object} sheets         — authenticated Sheets client
+ * @param {object} sheets
  * @param {object} summary
- * @param {string}  summary.date            — YYYY-MM-DD
- * @param {number}  summary.dailyTotal      — total $ donated that day
- * @param {number}  summary.dailyDonorCount — unique donors that day
- * @param {number}  summary.newDonorCount   — contacts created (first-ever donation)
+ * @param {string}  summary.date              — YYYY-MM-DD
+ * @param {number}  summary.dailyTotal        — total $ donated that day
+ * @param {number}  summary.dailyDonorCount   — unique donors that day (from Stripe)
+ * @param {number}  summary.newDonorCount     — first-ever Stripe donors that day
+ * @param {number}  [summary.overrideCumDonors] — if provided, use this value directly
+ *                                               instead of incrementing from the sheet.
+ *                                               Used during backfill where we track the
+ *                                               running set ourselves.
  */
 async function appendSheetRow(sheets, summary) {
   const { cumulativeTotal, cumulativeDonors } = await getLastCumulativeTotals(sheets);
-  const newCumulativeTotal  = parseFloat((cumulativeTotal + summary.dailyTotal).toFixed(2));
-  const newCumulativeDonors = cumulativeDonors + summary.newDonorCount;
+  const newCumulativeTotal = parseFloat((cumulativeTotal + summary.dailyTotal).toFixed(2));
+
+  // During backfill we pass the pre-computed cumulative donor count directly
+  // so it's based purely on the Stripe email set, not on HubSpot create/update.
+  const newCumulativeDonors =
+    summary.overrideCumDonors !== undefined
+      ? summary.overrideCumDonors
+      : cumulativeDonors + summary.newDonorCount;
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
@@ -403,15 +447,11 @@ async function appendSheetRow(sheets, summary) {
     `[sheets] Row appended → ${summary.date} | ` +
     `$${summary.dailyTotal.toFixed(2)} | ` +
     `${summary.dailyDonorCount} donors | ` +
-    `${summary.newDonorCount} new donors | ` +
-    `cumulative $${newCumulativeTotal.toFixed(2)} across ${newCumulativeDonors} donors`
+    `${summary.newDonorCount} new | ` +
+    `cumulative $${newCumulativeTotal.toFixed(2)} / ${newCumulativeDonors} donors`
   );
 }
 
-/**
- * Get an authenticated Sheets client, or return null if Sheets is not
- * configured (missing env vars). Logs a warning in that case.
- */
 async function getSheetsClientOrNull() {
   const sheetId = process.env.GOOGLE_SHEET_ID;
   if (!sheetId) {
@@ -426,52 +466,6 @@ async function getSheetsClientOrNull() {
   }
 }
 
-// ─── Single-day sync (shared by normal runs and backfill loop) ─────────────
-
-/**
- * Process one calendar day: upsert HubSpot contacts and return a summary
- * object ready for appendSheetRow. Does NOT write to the sheet itself.
- *
- * @param {Stripe}  stripe
- * @param {string}  dateString — YYYY-MM-DD
- * @returns {{ date, dailyTotal, dailyDonorCount, newDonorCount, failed }}
- */
-async function syncDay(stripe, dateString) {
-  const { windowStart, windowEnd } = dayWindow(dateString);
-  const charges  = await fetchChargesForDay(stripe, windowStart, windowEnd);
-  const donorMap = buildDonorMap(charges);
-
-  if (donorMap.size === 0) {
-    return { date: dateString, dailyTotal: 0, dailyDonorCount: 0, newDonorCount: 0, failed: 0 };
-  }
-
-  let created = 0, updated = 0, failed = 0;
-  let dailyTotal = 0;
-
-  for (const [email, donor] of donorMap) {
-    try {
-      const { action } = await upsertContact(email, donor);
-      dailyTotal = parseFloat((dailyTotal + donor.totalAmount).toFixed(2));
-      if (action === 'created') { created++; } else { updated++; }
-    } catch (err) {
-      const msg = err.response?.data?.message || err.message;
-      console.error(`  ✗ FAILED   ${email} — ${msg}`);
-      failed++;
-    }
-    await sleep(DELAY_MS);
-  }
-
-  return {
-    date:            dateString,
-    dailyTotal,
-    dailyDonorCount: donorMap.size,
-    newDonorCount:   created,
-    failed,
-    created,
-    updated,
-  };
-}
-
 // ─── Full historical backfill ───────────────────────────────────────────────
 
 /**
@@ -479,14 +473,16 @@ async function syncDay(stripe, dateString) {
  *
  * Fetches ALL Stripe charges, groups them by calendar date, and processes
  * each day in chronological order — upserting HubSpot contacts and writing
- * one sheet row per day. Leaves the sheet fully populated through yesterday.
+ * one sheet row per day.
+ *
+ * Cumulative donors is computed by walking a running Set of all-time seen
+ * emails in date order, using Stripe as the sole source of truth. HubSpot's
+ * created/updated distinction is intentionally ignored for this count.
  */
 async function runFullBackfill(stripe, sheets) {
   console.log('\n[backfill] Sheet is empty — running full historical backfill.');
   console.log('[backfill] This will populate HubSpot and the sheet with all-time data.\n');
 
-  // Fetch every charge from Stripe in one pass (more efficient than
-  // day-by-day fetching across potentially years of history).
   const allCharges = await fetchAllCharges(stripe);
 
   if (allCharges.length === 0) {
@@ -494,7 +490,7 @@ async function runFullBackfill(stripe, sheets) {
     return;
   }
 
-  // Partition charges by calendar date so we can write one sheet row per day.
+  // Partition charges by calendar date.
   const chargesByDate = new Map();
   for (const charge of allCharges) {
     const dateStr = new Date(charge.created * 1000).toISOString().split('T')[0];
@@ -502,28 +498,43 @@ async function runFullBackfill(stripe, sheets) {
     chargesByDate.get(dateStr).push(charge);
   }
 
-  const sortedDates = [...chargesByDate.keys()].sort();
-  const yesterday   = yesterdayUTC();
-
-  // Only backfill up through yesterday — today's charges aren't complete yet.
+  const sortedDates   = [...chargesByDate.keys()].sort();
+  const yesterday     = yesterdayUTC();
   const datesToProcess = sortedDates.filter((d) => d <= yesterday);
 
   console.log(`[backfill] ${datesToProcess.length} calendar day(s) to process ` +
               `(${datesToProcess[0]} → ${datesToProcess.at(-1)}).\n`);
 
+  // Running set of all emails ever seen — this is the source of truth for
+  // cumulative donor counts, built purely from Stripe data.
+  const allTimeSeenEmails = new Set();
+
   let totalCreated = 0, totalUpdated = 0, totalFailed = 0;
 
   for (let i = 0; i < datesToProcess.length; i++) {
-    const dateStr       = datesToProcess[i];
-    const dayCharges    = chargesByDate.get(dateStr);
-    const donorMap      = buildDonorMap(dayCharges);
+    const dateStr    = datesToProcess[i];
+    const dayCharges = chargesByDate.get(dateStr);
+    const donorMap   = buildDonorMap(dayCharges);
+
+    // Determine which emails are new to the all-time set on this day.
+    const newEmailsToday = [...donorMap.keys()].filter(e => !allTimeSeenEmails.has(e));
+    newEmailsToday.forEach(e => allTimeSeenEmails.add(e));
+
+    // Cumulative donor count at end of this day = size of the all-time set.
+    const cumulativeDonorsToday = allTimeSeenEmails.size;
 
     console.log(`[backfill] [${i + 1}/${datesToProcess.length}] ${dateStr} — ` +
-                `${dayCharges.length} charge(s), ${donorMap.size} donor(s)`);
+                `${dayCharges.length} charge(s), ${donorMap.size} donor(s), ` +
+                `${newEmailsToday.length} new (cumulative: ${cumulativeDonorsToday})`);
 
     if (donorMap.size === 0) {
-      // Write a zero row so the date still appears in the sheet.
-      await appendSheetRow(sheets, { date: dateStr, dailyTotal: 0, dailyDonorCount: 0, newDonorCount: 0 });
+      await appendSheetRow(sheets, {
+        date: dateStr,
+        dailyTotal: 0,
+        dailyDonorCount: 0,
+        newDonorCount: 0,
+        overrideCumDonors: cumulativeDonorsToday,
+      });
       continue;
     }
 
@@ -551,17 +562,18 @@ async function runFullBackfill(stripe, sheets) {
       console.warn(`  [backfill] ${dayFailed} failure(s) on ${dateStr} — sheet row skipped for this date.`);
     } else {
       await appendSheetRow(sheets, {
-        date:            dateStr,
+        date:              dateStr,
         dailyTotal,
-        dailyDonorCount: donorMap.size,
-        newDonorCount:   dayCreated,
+        dailyDonorCount:   donorMap.size,
+        newDonorCount:     newEmailsToday.length,  // Stripe-based, not HubSpot-based
+        overrideCumDonors: cumulativeDonorsToday,  // Stripe-based running total
       });
     }
   }
 
   console.log('\n────────────────────────────────────────');
   console.log('Backfill complete.');
-  console.log(`  Days processed : ${datesToProcess.length}`);
+  console.log(`  Days processed  : ${datesToProcess.length}`);
   console.log(`  Contacts created: ${totalCreated}`);
   console.log(`  Contacts updated: ${totalUpdated}`);
   console.log(`  Failures        : ${totalFailed}`);
@@ -585,7 +597,6 @@ async function run() {
   if (sheets && await isSheetEmpty(sheets)) {
     await ensureSheetHeader(sheets);
     await runFullBackfill(stripe, sheets);
-    // After backfill the sheet is current through yesterday, so we're done.
     return;
   }
 
@@ -596,6 +607,7 @@ async function run() {
   console.log(`[sync] Syncing charges for ${syncDate} ` +
               `(${new Date(windowStart * 1000).toISOString()} → ${new Date(windowEnd * 1000).toISOString()})`);
 
+  // Fetch today's charges for HubSpot sync + daily stats.
   const charges = await fetchChargesForDay(stripe, windowStart, windowEnd);
   console.log(`[sync] ${charges.length} succeeded charge(s) fetched from Stripe`);
 
@@ -606,9 +618,24 @@ async function run() {
     console.log('[sync] No donations that day — writing zero row to sheet.');
     if (sheets) {
       await ensureSheetHeader(sheets);
-      await appendSheetRow(sheets, { date: syncDate, dailyTotal: 0, dailyDonorCount: 0, newDonorCount: 0 });
+      // Zero-donation day: new donors = 0, cumulative donors unchanged.
+      await appendSheetRow(sheets, {
+        date: syncDate,
+        dailyTotal: 0,
+        dailyDonorCount: 0,
+        newDonorCount: 0,
+      });
     }
     return { created: 0, updated: 0, failed: 0 };
+  }
+
+  // Build the set of all emails that appeared in Stripe BEFORE today.
+  // Any email in today's donorMap that isn't in this set is a new cumulative donor.
+  let historicalEmailSet = new Set();
+  if (sheets) {
+    const allCharges = await fetchAllCharges(stripe, { silent: true });
+    historicalEmailSet = buildHistoricalEmailSet(allCharges, syncDate);
+    console.log(`[sync] Historical baseline: ${historicalEmailSet.size} unique donors before ${syncDate}`);
   }
 
   let created = 0, updated = 0, failed = 0;
@@ -635,11 +662,15 @@ async function run() {
     await sleep(DELAY_MS);
   }
 
+  // Count donors whose email has never appeared in Stripe before today.
+  const newDonorCount = [...donorMap.keys()].filter(e => !historicalEmailSet.has(e)).length;
+
   console.log(`\n────────────────────────────────────────`);
   console.log(`Sync complete for ${syncDate}.`);
-  console.log(`  Created: ${created}`);
-  console.log(`  Updated: ${updated}`);
-  console.log(`  Failed:  ${failed}`);
+  console.log(`  Daily donors : ${donorMap.size} (${newDonorCount} first-time)`);
+  console.log(`  HubSpot created: ${created}`);
+  console.log(`  HubSpot updated: ${updated}`);
+  console.log(`  Failed         : ${failed}`);
   console.log(`────────────────────────────────────────\n`);
 
   if (failed > 0) {
@@ -650,7 +681,9 @@ async function run() {
       date:            syncDate,
       dailyTotal,
       dailyDonorCount: donorMap.size,
-      newDonorCount:   created,
+      newDonorCount,             // Stripe-based: emails not seen before today
+      // No overrideCumDonors — appendSheetRow will add newDonorCount to the
+      // last row's cumulative value, which is correct for a normal nightly run.
     });
   }
 
