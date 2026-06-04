@@ -11,7 +11,17 @@
  * No .last_sync file is used — the time window is always deterministic
  * (yesterday), so every run is idempotent and self-contained.
  *
- * BACKFILL MODE (optional):
+ * FIRST RUN / EMPTY SHEET (automatic):
+ *   If the Google Sheet has no data rows when the script runs, it triggers a
+ *   full historical backfill automatically:
+ *     1. Fetches ALL succeeded charges from Stripe (entire account history).
+ *     2. Groups them by calendar date (UTC).
+ *     3. Upserts HubSpot contacts for every donor, day by day in order.
+ *     4. Writes one sheet row per calendar date, building a complete history.
+ *   After backfill completes, the sheet is fully up to date and subsequent
+ *   nightly runs continue normally from yesterday onward.
+ *
+ * BACKFILL MODE (manual):
  *   node sync.js --date YYYY-MM-DD
  *   Syncs a specific past date instead of yesterday. Useful for re-running a
  *   missed night or patching a gap in the sheet.
@@ -30,7 +40,7 @@
  *   GOOGLE_SERVICE_ACCOUNT_JSON     — full contents of the service account key JSON file
  *
  * HOW TO RUN MANUALLY:
- *   node sync.js                        → syncs yesterday
+ *   node sync.js                        → syncs yesterday (or backfills if sheet is empty)
  *   node sync.js --date 2025-06-01      → syncs a specific date
  *
  * DEPENDENCIES:
@@ -38,8 +48,6 @@
  */
 
 require('dotenv').config();
-const fs   = require('fs');
-const path = require('path');
 const axios  = require('axios');
 const Stripe = require('stripe');
 const { google } = require('googleapis');
@@ -74,9 +82,6 @@ function splitName(fullName = '') {
 /**
  * Parse a YYYY-MM-DD string (UTC) and return { windowStart, windowEnd } as
  * Unix timestamps covering the full calendar day.
- *
- *   windowStart = that date at 00:00:00 UTC (inclusive)
- *   windowEnd   = that date at 23:59:59 UTC (inclusive)
  */
 function dayWindow(dateString) {
   const windowStart = Math.floor(new Date(`${dateString}T00:00:00.000Z`).getTime() / 1000);
@@ -84,10 +89,7 @@ function dayWindow(dateString) {
   return { windowStart, windowEnd };
 }
 
-/**
- * Return yesterday's date as a YYYY-MM-DD string in UTC.
- * At 12:01 AM UTC this correctly resolves to the just-completed calendar day.
- */
+/** Return yesterday's date as a YYYY-MM-DD string in UTC. */
 function yesterdayUTC() {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() - 1);
@@ -106,18 +108,28 @@ function resolveSyncDate() {
   if (!val || !/^\d{4}-\d{2}-\d{2}$/.test(val)) {
     throw new Error('--date requires a value in YYYY-MM-DD format (e.g. --date 2025-06-01)');
   }
-  // Validate the date is real (e.g. not 2025-02-30)
   if (isNaN(new Date(`${val}T00:00:00.000Z`).getTime())) {
     throw new Error(`--date value "${val}" is not a valid calendar date`);
   }
   return val;
 }
 
+/**
+ * Given a list of all charges, return a sorted array of unique YYYY-MM-DD
+ * date strings (UTC) that appear in the data.
+ */
+function extractSortedDates(charges) {
+  const dateSet = new Set(
+    charges.map((c) => new Date(c.created * 1000).toISOString().split('T')[0])
+  );
+  return [...dateSet].sort();
+}
+
 // ─── Stripe ────────────────────────────────────────────────────────────────
 
 /**
- * Fetch all succeeded Stripe charges within a Unix timestamp window
- * [windowStart, windowEnd] (both inclusive). Automatically paginates.
+ * Fetch all succeeded Stripe charges within [windowStart, windowEnd].
+ * Automatically paginates through the full result set.
  */
 async function fetchChargesForDay(stripe, windowStart, windowEnd) {
   const charges = [];
@@ -138,6 +150,32 @@ async function fetchChargesForDay(stripe, windowStart, windowEnd) {
   return charges;
 }
 
+/**
+ * Fetch every succeeded charge in the Stripe account (no date filter).
+ * Used only during a full historical backfill.
+ */
+async function fetchAllCharges(stripe) {
+  const charges = [];
+  let startingAfter;
+
+  console.log('[backfill] Fetching all Stripe charges (this may take a moment)...');
+
+  do {
+    const params = { limit: 100 };
+    if (startingAfter) params.starting_after = startingAfter;
+
+    const page = await stripe.charges.list(params);
+    charges.push(...page.data.filter((c) => c.status === 'succeeded'));
+    startingAfter = page.has_more ? page.data.at(-1).id : undefined;
+
+    process.stdout.write(`\r[backfill] ${charges.length} charges fetched so far...`);
+  } while (startingAfter);
+
+  process.stdout.write('\n');
+  console.log(`[backfill] Done — ${charges.length} total succeeded charges.`);
+  return charges;
+}
+
 function isValidEmail(email) {
   if (!/^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/.test(email)) return false;
   const typoTLDs = ['.con', '.cmo', '.ocm', '.nte', '.rog', '.ogr', '.coj', '.cpm'];
@@ -146,7 +184,7 @@ function isValidEmail(email) {
 }
 
 /**
- * Group charges by email.
+ * Group a set of charges by email.
  * Returns Map<email, { totalAmount, latestCreated, latestAmount, cardName }>
  */
 function buildDonorMap(charges) {
@@ -210,9 +248,9 @@ async function findContactByEmail(email) {
 
 /**
  * Create or update a HubSpot contact, always incrementing
- * totalindividualdonations by the new day's amount.
+ * totalindividualdonations by the provided amount.
  *
- * Returns { action: 'created'|'updated', isNew: boolean }
+ * Returns { action: 'created'|'updated' }
  */
 async function upsertContact(email, donor) {
   const { totalAmount, latestCreated, latestAmount, cardName } = donor;
@@ -222,8 +260,6 @@ async function upsertContact(email, donor) {
   const existing = await findContactByEmail(email);
   await sleep(DELAY_MS);
 
-  // Always increment — each nightly run only ever sees one day of charges,
-  // so there's no "replace vs. add" ambiguity.
   let newTotal;
   if (!existing) {
     newTotal = totalAmount;
@@ -245,14 +281,14 @@ async function upsertContact(email, donor) {
       { properties: props },
       { headers: hubspotHeaders }
     );
-    return { action: 'updated', isNew: false };
+    return { action: 'updated' };
   } else {
     await axios.post(
       `${HUBSPOT_BASE}/crm/v3/objects/contacts`,
       { properties: { email, firstname, lastname, ...props } },
       { headers: hubspotHeaders }
     );
-    return { action: 'created', isNew: true };
+    return { action: 'created' };
   }
 }
 
@@ -271,6 +307,20 @@ async function getSheetsClient() {
 }
 
 /**
+ * Check whether the sheet has any data rows (rows beyond the header).
+ * Returns true if the sheet is empty (no data rows yet).
+ */
+async function isSheetEmpty(sheets) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${SHEET_TAB}!A:A`,
+  });
+  const rows = res.data.values || [];
+  // rows[0] would be the header; if length <= 1 there are no data rows
+  return rows.length <= 1;
+}
+
+/**
  * Read the last data row of columns E and F (cumulative totals).
  * Returns zeroes if the sheet has no data rows yet.
  */
@@ -281,7 +331,6 @@ async function getLastCumulativeTotals(sheets) {
   });
 
   const rows = res.data.values || [];
-  // Row 0 is the header; we want the last data row (index >= 1)
   if (rows.length <= 1) return { cumulativeTotal: 0, cumulativeDonors: 0 };
 
   const lastRow = rows[rows.length - 1];
@@ -319,37 +368,23 @@ async function ensureSheetHeader(sheets) {
 }
 
 /**
- * Append one summary row for the synced date.
+ * Append one summary row for the given date.
+ * Reads the current cumulative totals from the sheet and increments them.
  *
+ * @param {object} sheets         — authenticated Sheets client
  * @param {object} summary
- * @param {string}  summary.date            — YYYY-MM-DD (the synced day)
+ * @param {string}  summary.date            — YYYY-MM-DD
  * @param {number}  summary.dailyTotal      — total $ donated that day
  * @param {number}  summary.dailyDonorCount — unique donors that day
  * @param {number}  summary.newDonorCount   — contacts created (first-ever donation)
  */
-async function appendSheetRow(summary) {
-  const sheetId = process.env.GOOGLE_SHEET_ID;
-  if (!sheetId) {
-    console.log('[sheets] GOOGLE_SHEET_ID not set — skipping sheet update.');
-    return;
-  }
-
-  let sheets;
-  try {
-    sheets = await getSheetsClient();
-  } catch (err) {
-    console.warn(`[sheets] Could not authenticate — skipping sheet update. (${err.message})`);
-    return;
-  }
-
-  await ensureSheetHeader(sheets);
-
+async function appendSheetRow(sheets, summary) {
   const { cumulativeTotal, cumulativeDonors } = await getLastCumulativeTotals(sheets);
-  const newCumulativeTotal   = parseFloat((cumulativeTotal + summary.dailyTotal).toFixed(2));
-  const newCumulativeDonors  = cumulativeDonors + summary.newDonorCount;
+  const newCumulativeTotal  = parseFloat((cumulativeTotal + summary.dailyTotal).toFixed(2));
+  const newCumulativeDonors = cumulativeDonors + summary.newDonorCount;
 
   await sheets.spreadsheets.values.append({
-    spreadsheetId: sheetId,
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
     range: `${SHEET_TAB}!A:F`,
     valueInputOption: 'USER_ENTERED',
     requestBody: {
@@ -373,17 +408,193 @@ async function appendSheetRow(summary) {
   );
 }
 
+/**
+ * Get an authenticated Sheets client, or return null if Sheets is not
+ * configured (missing env vars). Logs a warning in that case.
+ */
+async function getSheetsClientOrNull() {
+  const sheetId = process.env.GOOGLE_SHEET_ID;
+  if (!sheetId) {
+    console.log('[sheets] GOOGLE_SHEET_ID not set — skipping sheet updates.');
+    return null;
+  }
+  try {
+    return await getSheetsClient();
+  } catch (err) {
+    console.warn(`[sheets] Could not authenticate — skipping sheet updates. (${err.message})`);
+    return null;
+  }
+}
+
+// ─── Single-day sync (shared by normal runs and backfill loop) ─────────────
+
+/**
+ * Process one calendar day: upsert HubSpot contacts and return a summary
+ * object ready for appendSheetRow. Does NOT write to the sheet itself.
+ *
+ * @param {Stripe}  stripe
+ * @param {string}  dateString — YYYY-MM-DD
+ * @returns {{ date, dailyTotal, dailyDonorCount, newDonorCount, failed }}
+ */
+async function syncDay(stripe, dateString) {
+  const { windowStart, windowEnd } = dayWindow(dateString);
+  const charges  = await fetchChargesForDay(stripe, windowStart, windowEnd);
+  const donorMap = buildDonorMap(charges);
+
+  if (donorMap.size === 0) {
+    return { date: dateString, dailyTotal: 0, dailyDonorCount: 0, newDonorCount: 0, failed: 0 };
+  }
+
+  let created = 0, updated = 0, failed = 0;
+  let dailyTotal = 0;
+
+  for (const [email, donor] of donorMap) {
+    try {
+      const { action } = await upsertContact(email, donor);
+      dailyTotal = parseFloat((dailyTotal + donor.totalAmount).toFixed(2));
+      if (action === 'created') { created++; } else { updated++; }
+    } catch (err) {
+      const msg = err.response?.data?.message || err.message;
+      console.error(`  ✗ FAILED   ${email} — ${msg}`);
+      failed++;
+    }
+    await sleep(DELAY_MS);
+  }
+
+  return {
+    date:            dateString,
+    dailyTotal,
+    dailyDonorCount: donorMap.size,
+    newDonorCount:   created,
+    failed,
+    created,
+    updated,
+  };
+}
+
+// ─── Full historical backfill ───────────────────────────────────────────────
+
+/**
+ * Triggered automatically when the sheet is empty on first run.
+ *
+ * Fetches ALL Stripe charges, groups them by calendar date, and processes
+ * each day in chronological order — upserting HubSpot contacts and writing
+ * one sheet row per day. Leaves the sheet fully populated through yesterday.
+ */
+async function runFullBackfill(stripe, sheets) {
+  console.log('\n[backfill] Sheet is empty — running full historical backfill.');
+  console.log('[backfill] This will populate HubSpot and the sheet with all-time data.\n');
+
+  // Fetch every charge from Stripe in one pass (more efficient than
+  // day-by-day fetching across potentially years of history).
+  const allCharges = await fetchAllCharges(stripe);
+
+  if (allCharges.length === 0) {
+    console.log('[backfill] No charges found in Stripe — nothing to backfill.');
+    return;
+  }
+
+  // Partition charges by calendar date so we can write one sheet row per day.
+  const chargesByDate = new Map();
+  for (const charge of allCharges) {
+    const dateStr = new Date(charge.created * 1000).toISOString().split('T')[0];
+    if (!chargesByDate.has(dateStr)) chargesByDate.set(dateStr, []);
+    chargesByDate.get(dateStr).push(charge);
+  }
+
+  const sortedDates = [...chargesByDate.keys()].sort();
+  const yesterday   = yesterdayUTC();
+
+  // Only backfill up through yesterday — today's charges aren't complete yet.
+  const datesToProcess = sortedDates.filter((d) => d <= yesterday);
+
+  console.log(`[backfill] ${datesToProcess.length} calendar day(s) to process ` +
+              `(${datesToProcess[0]} → ${datesToProcess.at(-1)}).\n`);
+
+  let totalCreated = 0, totalUpdated = 0, totalFailed = 0;
+
+  for (let i = 0; i < datesToProcess.length; i++) {
+    const dateStr       = datesToProcess[i];
+    const dayCharges    = chargesByDate.get(dateStr);
+    const donorMap      = buildDonorMap(dayCharges);
+
+    console.log(`[backfill] [${i + 1}/${datesToProcess.length}] ${dateStr} — ` +
+                `${dayCharges.length} charge(s), ${donorMap.size} donor(s)`);
+
+    if (donorMap.size === 0) {
+      // Write a zero row so the date still appears in the sheet.
+      await appendSheetRow(sheets, { date: dateStr, dailyTotal: 0, dailyDonorCount: 0, newDonorCount: 0 });
+      continue;
+    }
+
+    let dayCreated = 0, dayUpdated = 0, dayFailed = 0;
+    let dailyTotal = 0;
+
+    for (const [email, donor] of donorMap) {
+      try {
+        const { action } = await upsertContact(email, donor);
+        dailyTotal = parseFloat((dailyTotal + donor.totalAmount).toFixed(2));
+        if (action === 'created') { dayCreated++; } else { dayUpdated++; }
+      } catch (err) {
+        const msg = err.response?.data?.message || err.message;
+        console.error(`  ✗ FAILED   ${email} — ${msg}`);
+        dayFailed++;
+      }
+      await sleep(DELAY_MS);
+    }
+
+    totalCreated += dayCreated;
+    totalUpdated += dayUpdated;
+    totalFailed  += dayFailed;
+
+    if (dayFailed > 0) {
+      console.warn(`  [backfill] ${dayFailed} failure(s) on ${dateStr} — sheet row skipped for this date.`);
+    } else {
+      await appendSheetRow(sheets, {
+        date:            dateStr,
+        dailyTotal,
+        dailyDonorCount: donorMap.size,
+        newDonorCount:   dayCreated,
+      });
+    }
+  }
+
+  console.log('\n────────────────────────────────────────');
+  console.log('Backfill complete.');
+  console.log(`  Days processed : ${datesToProcess.length}`);
+  console.log(`  Contacts created: ${totalCreated}`);
+  console.log(`  Contacts updated: ${totalUpdated}`);
+  console.log(`  Failures        : ${totalFailed}`);
+  console.log('────────────────────────────────────────\n');
+
+  if (totalFailed > 0) {
+    console.warn('[backfill] Some days had failures. Re-run with --date YYYY-MM-DD to patch gaps.');
+  }
+}
+
 // ─── Main ──────────────────────────────────────────────────────────────────
 
 async function run() {
   if (!process.env.HUBSPOT_ACCESS_TOKEN) throw new Error('HUBSPOT_ACCESS_TOKEN not set in .env');
   if (!process.env.STRIPE_SECRET_KEY)    throw new Error('STRIPE_SECRET_KEY not set in .env');
 
-  const stripe   = new Stripe(process.env.STRIPE_SECRET_KEY);
+  const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+  const sheets = await getSheetsClientOrNull();
+
+  // ── Full historical backfill (only when sheet is empty) ──────────────────
+  if (sheets && await isSheetEmpty(sheets)) {
+    await ensureSheetHeader(sheets);
+    await runFullBackfill(stripe, sheets);
+    // After backfill the sheet is current through yesterday, so we're done.
+    return;
+  }
+
+  // ── Normal nightly run (or manual --date backfill) ───────────────────────
   const syncDate = resolveSyncDate();
   const { windowStart, windowEnd } = dayWindow(syncDate);
 
-  console.log(`[sync] Syncing charges for ${syncDate} (${new Date(windowStart * 1000).toISOString()} → ${new Date(windowEnd * 1000).toISOString()})`);
+  console.log(`[sync] Syncing charges for ${syncDate} ` +
+              `(${new Date(windowStart * 1000).toISOString()} → ${new Date(windowEnd * 1000).toISOString()})`);
 
   const charges = await fetchChargesForDay(stripe, windowStart, windowEnd);
   console.log(`[sync] ${charges.length} succeeded charge(s) fetched from Stripe`);
@@ -393,7 +604,10 @@ async function run() {
 
   if (donorMap.size === 0) {
     console.log('[sync] No donations that day — writing zero row to sheet.');
-    await appendSheetRow({ date: syncDate, dailyTotal: 0, dailyDonorCount: 0, newDonorCount: 0 });
+    if (sheets) {
+      await ensureSheetHeader(sheets);
+      await appendSheetRow(sheets, { date: syncDate, dailyTotal: 0, dailyDonorCount: 0, newDonorCount: 0 });
+    }
     return { created: 0, updated: 0, failed: 0 };
   }
 
@@ -430,8 +644,9 @@ async function run() {
 
   if (failed > 0) {
     console.warn(`[sync] ${failed} failure(s) — sheet row NOT written. Re-run with --date ${syncDate} to retry.`);
-  } else {
-    await appendSheetRow({
+  } else if (sheets) {
+    await ensureSheetHeader(sheets);
+    await appendSheetRow(sheets, {
       date:            syncDate,
       dailyTotal,
       dailyDonorCount: donorMap.size,
