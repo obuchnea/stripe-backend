@@ -3,6 +3,7 @@ const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const cors = require('cors');
 const axios = require('axios');
+const nodemailer = require('nodemailer');
 
 const app = express();
 app.use(express.json());
