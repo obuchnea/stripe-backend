@@ -186,6 +186,79 @@ async function fetchAllCharges(stripe, { silent = false } = {}) {
   return charges;
 }
 
+async function enrichChargeAddress(stripe, charge) {
+  const hasAddress = charge.billing_details?.address?.line1;
+  let enriched = charge;
+
+  if (!hasAddress) {
+    try {
+      enriched = await stripe.charges.retrieve(charge.id, {
+        expand: ['payment_intent'],
+      });
+      await sleep(DELAY_MS);
+    } catch (err) {
+      console.warn(`[stripe] Could not enrich charge ${charge.id}: ${err.message}`);
+      enriched = charge;
+    }
+  } else {
+    // Still need to expand payment_intent for phone lookup
+    try {
+      enriched = await stripe.charges.retrieve(charge.id, {
+        expand: ['payment_intent'],
+      });
+      await sleep(DELAY_MS);
+    } catch (_) {}
+  }
+
+  // Try to get phone from the Checkout Session linked to the Payment Intent
+  let phone = '';
+  const paymentIntentId = enriched.payment_intent?.id || enriched.payment_intent;
+
+  if (paymentIntentId) {
+    try {
+      // Find the checkout session for this payment intent
+      const sessions = await stripe.checkout.sessions.list({
+        payment_intent: paymentIntentId,
+        limit: 1,
+        expand: ['data.custom_fields'],
+      });
+      await sleep(DELAY_MS);
+
+      if (sessions.data.length > 0) {
+        const session = sessions.data[0];
+
+        // 1. Check phone_number_collection (Stripe's built-in phone field)
+        phone = session.customer_details?.phone || '';
+
+        // 2. If still empty, check custom fields (if you used a custom phone field)
+        if (!phone && session.custom_fields?.length) {
+          const phoneField = session.custom_fields.find(
+            f => f.key?.toLowerCase().includes('phone') ||
+                 f.label?.custom?.toLowerCase().includes('phone')
+          );
+          phone = phoneField?.text?.value || phoneField?.dropdown?.value || '';
+        }
+      }
+    } catch (err) {
+      console.warn(`[stripe] Could not fetch checkout session for PI ${paymentIntentId}: ${err.message}`);
+    }
+  }
+
+  // Fallback to customer phone if session lookup failed
+  if (!phone && enriched.customer) {
+    try {
+      const customer = await stripe.customers.retrieve(enriched.customer);
+      await sleep(DELAY_MS);
+      phone = customer.phone || '';
+    } catch (err) {
+      console.warn(`[stripe] Could not retrieve customer for charge ${charge.id}: ${err.message}`);
+    }
+  }
+
+  enriched._customerPhone = phone;
+  return enriched;
+}
+
 function isValidEmail(email) {
   if (!/^[^\s@]+@[^\s@]+\.[a-zA-Z]{2,}$/.test(email)) return false;
   const typoTLDs = ['.con', '.cmo', '.ocm', '.nte', '.rog', '.ogr', '.coj', '.cpm'];
@@ -220,6 +293,8 @@ function buildDonorMap(charges) {
     const amount   = charge.amount / 100;
     const created  = charge.created;
     const cardName = charge.billing_details?.name || '';
+    const address = charge.payment_method?.billing_details?.address || charge.billing_details?.address || {};
+    const phone = charge._customerPhone || charge.billing_details?.phone || '';
 
     if (donors.has(email)) {
       const d = donors.get(email);
@@ -229,6 +304,8 @@ function buildDonorMap(charges) {
         d.latestAmount  = amount;
         d.cardName      = cardName || d.cardName;
         d.id            = charge.id;
+        d.address       = address;
+        d.phone         = phone;
       }
     } else {
       donors.set(email, {
@@ -237,6 +314,8 @@ function buildDonorMap(charges) {
         latestAmount: amount,
         cardName,
         id: charge.id,
+        address: address,
+        phone: phone
       });
     }
   }
@@ -585,7 +664,7 @@ async function appendDonorRows(sheets, donorRows) {
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range:         `${DONORS_SHEET_TAB}!A:F`,
+    range:         `${DONORS_SHEET_TAB}!A:H`,
     valueInputOption: 'RAW',
     requestBody: { values: donorRows },
   });
@@ -641,7 +720,7 @@ async function getSheetsClientOrNull() {
  * @param {number}   summary.hubspotCreated
  * @param {number}   summary.hubspotUpdated
  * @param {number}   summary.failed
- * @param {Array}    summary.donorRows  — array of [date, email, first, last, amount, chargeId]
+ * @param {Array}    summary.donorRows  — array of [date, email, first, last, amount, chargeId, phone, address]
  */
 async function sendSummaryEmail(summary) {
   const { SMTP_USER, SMTP_PASS, SUMMARY_EMAIL_TO } = process.env;
@@ -695,7 +774,7 @@ async function sendSummaryEmail(summary) {
 
   // ── CSV attachment ────────────────────────────────────────────────────────
   // donorRows: [date, email, firstname, lastname, amount, chargeId]
-  const csvHeader = 'Date,Email,First Name,Last Name,Amount ($),Charge ID\n';
+  const csvHeader = 'Date,Email,First Name,Last Name,Amount ($),Charge ID,Phone,Street Address\n';
   const csvBody   = summary.donorRows
     .map(r => r.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(','))
     .join('\n');
@@ -788,10 +867,19 @@ async function runFullBackfill(stripe, sheets) {
     return;
   }
 
-  const chargeCache = new Map(allCharges.map((c) => [c.id, c]));
+  // Enrich charges that are missing address data with a full retrieve
+  console.log('[backfill] Enriching charges with address data...');
+  const enrichedCharges = [];
+  for (const charge of allCharges) {
+    const enriched = await enrichChargeAddress(stripe, charge);
+    enrichedCharges.push(enriched);
+  }
+  console.log('[backfill] Enrichment complete.\n');
+
+  const chargeCache = new Map(enrichedCharges.map((c) => [c.id, c]));
 
   const chargesByDate = new Map();
-  for (const charge of allCharges) {
+  for (const charge of enrichedCharges) {
     const dateStr = new Date(charge.created * 1000).toISOString().split('T')[0];
     if (!chargesByDate.has(dateStr)) chargesByDate.set(dateStr, []);
     chargesByDate.get(dateStr).push(charge);
@@ -840,7 +928,15 @@ async function runFullBackfill(stripe, sheets) {
         if (action === 'created') { dayCreated++; } else { dayUpdated++; }
 
         const { firstname, lastname } = splitName(donor.cardName);
-        donorRows.push([dateStr, email, firstname, lastname, donor.totalAmount, donor.id]);
+        const addr = donor.address || {};
+        const streetAddress = [addr.line1, addr.line2].filter(Boolean).join(' ');
+
+        donorRows.push([
+          dateStr, email, firstname, lastname,
+          donor.totalAmount, donor.id,
+          donor.phone || '',
+          streetAddress,
+        ]);
       } catch (err) {
         const msg = err.response?.data?.message || err.message;
         console.error(`  ✗ FAILED   ${email} — ${msg}`);
@@ -910,8 +1006,6 @@ async function runFullBackfill(stripe, sheets) {
   if (totalFailed > 0 || totalRefundFailed > 0) {
     console.warn('[backfill] Some days had failures. Re-run with --date YYYY-MM-DD to patch gaps.');
   }
-
-  // No summary email after backfill — it covers many days, not a single day's report.
 }
 
 // ─── Main ──────────────────────────────────────────────────────────────────
@@ -940,7 +1034,12 @@ async function run() {
   const charges = await fetchChargesForDay(stripe, windowStart, windowEnd);
   console.log(`[sync] ${charges.length} succeeded charge(s) fetched from Stripe`);
 
-  const donorMap = buildDonorMap(charges);
+  // Enrich any charges missing address data
+  const enrichedCharges = await Promise.all(
+    charges.map(c => enrichChargeAddress(stripe, c))
+  );
+
+  const donorMap = buildDonorMap(enrichedCharges);
   console.log(`[sync] ${donorMap.size} unique donor(s) to process`);
 
   const chargeCache = new Map(charges.map((c) => [c.id, c]));
@@ -973,7 +1072,15 @@ async function run() {
       }
 
       const { firstname, lastname } = splitName(donor.cardName);
-      donorRows.push([syncDate, email, firstname, lastname, donor.totalAmount, donor.id]);
+      const addr = donor.address || {};
+      const streetAddress = [addr.line1, addr.line2].filter(Boolean).join(' ');
+
+      donorRows.push([
+        syncDate, email, firstname, lastname,
+        donor.totalAmount, donor.id,
+        donor.phone || '',
+        streetAddress,
+      ]);
 
     } catch (err) {
       const msg = err.response?.data?.message || err.message;
