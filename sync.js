@@ -761,9 +761,6 @@ async function sendSummaryEmail(summary) {
           ${row('Net Daily',            `$${summary.netDaily.toFixed(2)}`)}
           ${row('Cumulative Total',     `$${summary.newCumulativeTotal.toFixed(2)}`)}
           ${row('Cumulative Donors',    summary.newCumulativeDonors)}
-          ${row('HubSpot Created',      summary.hubspotCreated)}
-          ${row('HubSpot Updated',      summary.hubspotUpdated)}
-          ${row('Failures',             summary.failed)}
         </tbody>
       </table>
       <p style="font-size:12px;color:#888;margin-top:16px;">
