@@ -731,7 +731,9 @@ async function sendSummaryEmail(summary) {
   }
 
   const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,       // STARTTLS, not SSL
     auth: {
       user: SMTP_USER,
       pass: SMTP_PASS,
