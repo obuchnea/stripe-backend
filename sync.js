@@ -231,37 +231,38 @@ async function enrichChargeAddress(stripe, charge) {
   const paymentIntentId = enriched.payment_intent?.id || enriched.payment_intent;
 
   if (paymentIntentId) {
-    try {
-      // Find the checkout session for this payment intent
-      const sessions = await stripe.checkout.sessions.list({
-        payment_intent: paymentIntentId,
-        limit: 1,
-        expand: ['data.custom_fields'],
-      });
-      await sleep(DELAY_MS);
+  try {
+    const sessions = await stripe.checkout.sessions.list({
+      payment_intent: paymentIntentId,
+      limit: 1,
+      expand: ['data.custom_fields'],
+    });
+    await sleep(DELAY_MS);
 
-      if (sessions.data.length > 0) {
-        const session = sessions.data[0];
-
-        // 1. Check phone_number_collection (Stripe's built-in phone field)
-        phone = session.customer_details?.phone || '';
-
-        // 2. If still empty, check custom fields (if you used a custom phone field)
-        if (!phone && session.custom_fields?.length) {
-          const phoneField = session.custom_fields.find(
-            f => f.key?.toLowerCase().includes('phone') ||
-                 f.label?.custom?.toLowerCase().includes('phone')
-          );
-          phone = phoneField?.text?.value || phoneField?.dropdown?.value || '';
-        }
-
-        // 3. Read referrer_id from session metadata (set at checkout creation time)
-        referrerId = session.metadata?.referrer_id || enriched.payment_intent?.metadata?.referrer_id || '';
+    if (sessions.data.length > 0) {
+      const session = sessions.data[0];
+      phone      = session.customer_details?.phone || '';
+      if (!phone && session.custom_fields?.length) {
+        const phoneField = session.custom_fields.find(
+          f => f.key?.toLowerCase().includes('phone') ||
+               f.label?.custom?.toLowerCase().includes('phone')
+        );
+        phone = phoneField?.text?.value || phoneField?.dropdown?.value || '';
       }
-    } catch (err) {
-      console.warn(`[stripe] Could not fetch checkout session for PI ${paymentIntentId}: ${err.message}`);
+      referrerId = session.metadata?.referrer_id || '';
     }
+
+    // Always fall back to Payment Intent metadata regardless of session result
+    if (!referrerId) {
+      referrerId = enriched.payment_intent?.metadata?.referrer_id || '';
+    }
+
+  } catch (err) {
+    console.warn(`[stripe] Could not fetch checkout session for PI ${paymentIntentId}: ${err.message}`);
+    // Still try PI metadata even if session lookup threw
+    referrerId = enriched.payment_intent?.metadata?.referrer_id || '';
   }
+}
 
   // Fallback to customer phone if session lookup failed
   if (!phone && enriched.customer) {
