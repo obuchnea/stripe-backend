@@ -36,6 +36,22 @@
  *   emails is rebuilt from the full Stripe charge history on every run, so the
  *   cumulative count is always accurate and self-healing.
  *
+ * HOW REFERRAL ATTRIBUTION WORKS:
+ *   Donations are attributed to referrers on a per-transaction basis. When a
+ *   donor clicks a referral link (e.g. ?ref=jane-smith) and completes a
+ *   checkout, the ref value must be stored in the Stripe Checkout Session's
+ *   metadata under the key "referrer_id". This script reads that value from
+ *   each session and writes it as a "Referrer" column in the Donors sheet tab.
+ *
+ *   Attribution rules:
+ *     - Every charge is independently attributed to whichever ref was on that
+ *       session. A donor can appear in multiple referrers' totals over time.
+ *     - If a donor makes multiple charges on the same calendar day, the
+ *       referrer from the most recent charge is recorded for that day's row.
+ *     - If no ref was present, the Referrer column is left blank.
+ *     - Attribution is never stored on the HubSpot contact — it lives only
+ *       in the Donors sheet tab, queryable via SUMIF or a pivot table.
+ *
  * No .last_sync file is used — the time window is always deterministic
  * (yesterday), so every run is idempotent and self-contained.
  *
@@ -64,8 +80,8 @@
  * OPTIONAL ENV VARS — omit to skip the relevant feature:
  *   GOOGLE_SHEET_ID                 — ID from the sheet URL
  *   GOOGLE_SERVICE_ACCOUNT_JSON     — full contents of the service account key JSON
- *   SMTP_USER                       — Gmail address to send from
- *   SMTP_PASS                       — Gmail App Password (16-char code)
+ *   RESEND_API_KEY                  — API key from resend.com
+ *   RESEND_FROM                     — verified sender address (e.g. Donations <you@yourdomain.com>)
  *   SUMMARY_EMAIL_TO                — recipient address for the daily summary email
  *
  * HOW TO RUN MANUALLY:
@@ -73,14 +89,13 @@
  *   node sync.js --date 2025-06-01      → syncs a specific date
  *
  * DEPENDENCIES:
- *   npm install dotenv axios stripe googleapis nodemailer
+ *   npm install dotenv axios stripe googleapis resend
  */
 
 require('dotenv').config();
 const axios        = require('axios');
 const Stripe       = require('stripe');
 const { google }   = require('googleapis');
-const nodemailer   = require('nodemailer');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -210,8 +225,9 @@ async function enrichChargeAddress(stripe, charge) {
     } catch (_) {}
   }
 
-  // Try to get phone from the Checkout Session linked to the Payment Intent
-  let phone = '';
+  // Try to get phone and referrer_id from the Checkout Session linked to the Payment Intent
+  let phone      = '';
+  let referrerId = '';
   const paymentIntentId = enriched.payment_intent?.id || enriched.payment_intent;
 
   if (paymentIntentId) {
@@ -238,6 +254,9 @@ async function enrichChargeAddress(stripe, charge) {
           );
           phone = phoneField?.text?.value || phoneField?.dropdown?.value || '';
         }
+
+        // 3. Read referrer_id from session metadata (set at checkout creation time)
+        referrerId = session.metadata?.referrer_id || enriched.payment_intent?.metadata?.referrer_id || '';
       }
     } catch (err) {
       console.warn(`[stripe] Could not fetch checkout session for PI ${paymentIntentId}: ${err.message}`);
@@ -256,6 +275,7 @@ async function enrichChargeAddress(stripe, charge) {
   }
 
   enriched._customerPhone = phone;
+  enriched._referrerId    = referrerId;
   return enriched;
 }
 
@@ -290,11 +310,12 @@ function buildDonorMap(charges) {
     const email = emailFromCharge(charge);
     if (!email) continue;
 
-    const amount   = charge.amount / 100;
-    const created  = charge.created;
-    const cardName = charge.billing_details?.name || '';
-    const address = charge.payment_method?.billing_details?.address || charge.billing_details?.address || {};
-    const phone = charge._customerPhone || charge.billing_details?.phone || '';
+    const amount     = charge.amount / 100;
+    const created    = charge.created;
+    const cardName   = charge.billing_details?.name || '';
+    const address    = charge.payment_method?.billing_details?.address || charge.billing_details?.address || {};
+    const phone      = charge._customerPhone || charge.billing_details?.phone || '';
+    const referrerId = charge._referrerId || '';
 
     if (donors.has(email)) {
       const d = donors.get(email);
@@ -306,6 +327,8 @@ function buildDonorMap(charges) {
         d.id            = charge.id;
         d.address       = address;
         d.phone         = phone;
+        // Update referrer to the one on the most recent charge; keep existing if new charge has none
+        d.referrerId    = referrerId || d.referrerId;
       }
     } else {
       donors.set(email, {
@@ -314,8 +337,9 @@ function buildDonorMap(charges) {
         latestAmount: amount,
         cardName,
         id: charge.id,
-        address: address,
-        phone: phone
+        address,
+        phone,
+        referrerId,
       });
     }
   }
@@ -576,6 +600,36 @@ async function ensureSummaryHeader(sheets) {
   }
 }
 
+async function ensureDonorsHeader(sheets) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${DONORS_SHEET_TAB}!A1:I1`,
+  });
+
+  const firstRow = res.data.values?.[0];
+  if (!firstRow || firstRow.length === 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${DONORS_SHEET_TAB}!A1:I1`,
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [[
+          'Date',
+          'Email',
+          'First Name',
+          'Last Name',
+          'Amount ($)',
+          'Charge ID',
+          'Phone',
+          'Street Address',
+          'Referrer',
+        ]],
+      },
+    });
+    console.log('[sheets] Donors header row written.');
+  }
+}
+
 async function ensureRefundsHeader(sheets) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
@@ -606,6 +660,7 @@ async function ensureRefundsHeader(sheets) {
 
 async function ensureSheetHeaders(sheets) {
   await ensureSummaryHeader(sheets);
+  await ensureDonorsHeader(sheets);
   await ensureRefundsHeader(sheets);
 }
 
@@ -664,7 +719,7 @@ async function appendDonorRows(sheets, donorRows) {
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: process.env.GOOGLE_SHEET_ID,
-    range:         `${DONORS_SHEET_TAB}!A:H`,
+    range:         `${DONORS_SHEET_TAB}!A:I`,   // expanded from A:H to include Referrer column
     valueInputOption: 'RAW',
     requestBody: { values: donorRows },
   });
@@ -705,7 +760,7 @@ async function getSheetsClientOrNull() {
  * Send a daily summary email with an HTML stats table and a CSV attachment
  * of that day's donor rows.
  *
- * Silently skips if SMTP_USER, SMTP_PASS, or SUMMARY_EMAIL_TO are not set.
+ * Silently skips if RESEND_API_KEY or SUMMARY_EMAIL_TO are not set.
  *
  * @param {object} summary
  * @param {string}   summary.date
@@ -720,25 +775,18 @@ async function getSheetsClientOrNull() {
  * @param {number}   summary.hubspotCreated
  * @param {number}   summary.hubspotUpdated
  * @param {number}   summary.failed
- * @param {Array}    summary.donorRows  — array of [date, email, first, last, amount, chargeId, phone, address]
+ * @param {Array}    summary.donorRows  — array of [date, email, first, last, amount, chargeId, phone, address, referrerId]
  */
 async function sendSummaryEmail(summary) {
-  const { SMTP_USER, SMTP_PASS, SUMMARY_EMAIL_TO } = process.env;
+  const { RESEND_API_KEY, SUMMARY_EMAIL_TO, RESEND_FROM } = process.env;
 
-  if (!SMTP_USER || !SMTP_PASS || !SUMMARY_EMAIL_TO) {
-    console.log('[email] SMTP env vars not set — skipping summary email.');
+  if (!RESEND_API_KEY || !SUMMARY_EMAIL_TO) {
+    console.log('[email] RESEND_API_KEY or SUMMARY_EMAIL_TO not set — skipping summary email.');
     return;
   }
 
-  const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 587,
-    secure: false,       // STARTTLS, not SSL
-    auth: {
-      user: SMTP_USER,
-      pass: SMTP_PASS,
-    },
-  });
+  const { Resend } = require('resend');
+  const resend = new Resend(RESEND_API_KEY);
 
   // ── HTML body ─────────────────────────────────────────────────────────────
   const row = (label, value) =>
@@ -772,27 +820,23 @@ async function sendSummaryEmail(summary) {
   `;
 
   // ── CSV attachment ────────────────────────────────────────────────────────
-  // donorRows: [date, email, firstname, lastname, amount, chargeId]
-  const csvHeader = 'Date,Email,First Name,Last Name,Amount ($),Charge ID,Phone,Street Address\n';
-  const csvBody   = summary.donorRows
+  const csvHeader  = 'Date,Email,First Name,Last Name,Amount ($),Charge ID,Phone,Street Address,Referrer\n';
+  const csvBody    = summary.donorRows
     .map(r => r.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(','))
     .join('\n');
   const csvContent = csvHeader + csvBody;
 
-  // ── Send ──────────────────────────────────────────────────────────────────
+  // ── Send via Resend ───────────────────────────────────────────────────────
   try {
-    await transporter.sendMail({
-      from:    SMTP_USER,
+    await resend.emails.send({
+      from:    RESEND_FROM || 'Donations <onboarding@resend.dev>',
       to:      SUMMARY_EMAIL_TO,
       subject: `Donation Summary — ${summary.date}`,
       html,
-      attachments: [
-        {
-          filename:    `donors-${summary.date}.csv`,
-          content:     csvContent,
-          contentType: 'text/csv',
-        },
-      ],
+      attachments: [{
+        filename: `donors-${summary.date}.csv`,
+        content:  Buffer.from(csvContent).toString('base64'),
+      }],
     });
     console.log(`[email] Summary email sent to ${SUMMARY_EMAIL_TO}`);
   } catch (err) {
@@ -866,8 +910,8 @@ async function runFullBackfill(stripe, sheets) {
     return;
   }
 
-  // Enrich charges that are missing address data with a full retrieve
-  console.log('[backfill] Enriching charges with address data...');
+  // Enrich charges with address, phone, and referrer_id data
+  console.log('[backfill] Enriching charges with address, phone, and referrer data...');
   const enrichedCharges = [];
   for (const charge of allCharges) {
     const enriched = await enrichChargeAddress(stripe, charge);
@@ -935,6 +979,7 @@ async function runFullBackfill(stripe, sheets) {
           donor.totalAmount, donor.id,
           donor.phone || '',
           streetAddress,
+          donor.referrerId || '',
         ]);
       } catch (err) {
         const msg = err.response?.data?.message || err.message;
@@ -1033,7 +1078,7 @@ async function run() {
   const charges = await fetchChargesForDay(stripe, windowStart, windowEnd);
   console.log(`[sync] ${charges.length} succeeded charge(s) fetched from Stripe`);
 
-  // Enrich any charges missing address data
+  // Enrich charges with address, phone, and referrer_id data
   const enrichedCharges = await Promise.all(
     charges.map(c => enrichChargeAddress(stripe, c))
   );
@@ -1079,6 +1124,7 @@ async function run() {
         donor.totalAmount, donor.id,
         donor.phone || '',
         streetAddress,
+        donor.referrerId || '',
       ]);
 
     } catch (err) {

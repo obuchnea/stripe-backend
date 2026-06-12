@@ -63,7 +63,7 @@ app.get('/', (req, res) => {
  */
 app.post('/create-payment-intent', async (req, res) => {
   try {
-    const { amount, currency, email } = req.body;
+    const { amount, currency, email, ref } = req.body; // add ref here
 
     if (!amount || typeof amount !== 'number' || amount <= 0) {
       return res.status(400).json({ error: 'Invalid amount' });
@@ -73,7 +73,10 @@ app.post('/create-payment-intent', async (req, res) => {
       amount,
       currency: currency || 'cad',
       automatic_payment_methods: { enabled: true },
-      metadata: { email: email || '' },
+      metadata: {
+        email: email || '',
+        referrer_id: ref || '',
+      },
     });
 
     res.json({ clientSecret: paymentIntent.client_secret });
