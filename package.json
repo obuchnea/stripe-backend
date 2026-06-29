@@ -11,8 +11,9 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "axios": "^1.17.0",
+    "axios": "^1.18.0",
     "cors": "^2.8.6",
+    "csv-parse": "^7.0.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "googleapis": "^173.0.0",
