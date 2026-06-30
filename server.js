@@ -63,24 +63,32 @@ app.get('/', (req, res) => {
  */
 app.post('/create-payment-intent', async (req, res) => {
   try {
-    const { amount, currency, email, ref } = req.body; // add ref here
+    const { amount, currency, email, ref } = req.body;
 
     if (!amount || typeof amount !== 'number' || amount <= 0) {
       return res.status(400).json({ error: 'Invalid amount' });
     }
 
-    const paymentIntent = await stripe.paymentIntents.create({
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const trimmedEmail = typeof email === 'string' ? email.trim() : '';
+    const isValidEmail = emailRegex.test(trimmedEmail);
+
+    const intentParams = {
       amount,
       currency: currency || 'cad',
-      receipt_email: email,
       automatic_payment_methods: { enabled: false },
       payment_method_types: ["card"],
       metadata: {
-        email: email || '',
+        email: trimmedEmail,
         referrer_id: ref || '',
       },
-    });
+    };
 
+    if (isValidEmail) {
+      intentParams.receipt_email = trimmedEmail;
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create(intentParams);
     res.json({ clientSecret: paymentIntent.client_secret });
   } catch (error) {
     console.error('Create payment intent error:', error.message);
@@ -101,6 +109,8 @@ app.post('/create-payment-intent', async (req, res) => {
  * donation_limit_reached, donation_compliance_status) update automatically
  * in HubSpot the moment totalindividualdonations changes — no code needed.
  */
+
+
 app.post('/donation-complete', async (req, res) => {
   try {
     const { email, firstName, lastName, amount, paymentIntentId } = req.body;
