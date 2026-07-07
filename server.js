@@ -33,7 +33,7 @@ async function findContactByEmail(email) {
           value: email,
         }],
       }],
-      properties: ['email', 'firstname', 'lastname', 'totalindividualdonations', 'referral_link'],
+      properties: ['email', 'firstname', 'lastname', 'totalindividualdonations', 'referral_link', 'refer_code'],
       limit: 1,
     },
     { headers: hubspotHeaders() }
@@ -185,16 +185,20 @@ app.post('/donation-complete', async (req, res) => {
 
 function slugifyName(str = '') {
   return str
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip accents
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '')
     .trim();
 }
 
-function buildReferralLink(firstname, lastname, contactId) {
+function buildReferralCode(firstname, lastname, contactId) {
   const base = `${slugifyName(firstname)}_${slugifyName(lastname)}`;
-  const suffix = contactId.slice(-4); // guards against name collisions
-  return `https://www.leefairclough.ca/member?referred_by_id=${base}_${suffix}`;
+  const suffix = contactId.slice(-4);
+  return `${base}_${suffix}`;
+}
+
+function buildReferralLink(code) {
+  return `https://www.leefairclough.ca/member?referred_by_id=${code}`;
 }
 
 // findContactByEmail already exists — just add referral_link to the properties array:
@@ -216,21 +220,21 @@ app.post('/api/referral/lookup', async (req, res) => {
       return res.json({ exists: false });
     }
 
-    // Already has a link — idempotent return, no HubSpot write, no workflow re-trigger
-    if (contact.properties.referral_link) {
+    // Already generated — idempotent return, no HubSpot write
+    if (contact.properties.referral_link && contact.properties.refer_code) {
       return res.json({ exists: true, referralLink: contact.properties.referral_link });
     }
 
-    // Contact exists but no link yet — generate and set it now
-    const referralLink = buildReferralLink(
+    const referCode = buildReferralCode(
       contact.properties.firstname || '',
       contact.properties.lastname || '',
       contact.id
     );
+    const referralLink = buildReferralLink(referCode);
 
     await axios.patch(
       `https://api.hubapi.com/crm/v3/objects/contacts/${contact.id}`,
-      { properties: { referral_link: referralLink } },
+      { properties: { referral_link: referralLink, refer_code: referCode } },
       { headers: hubspotHeaders() }
     );
 
@@ -267,11 +271,12 @@ app.post('/api/referral/create', async (req, res) => {
     );
 
     const contactId = createRes.data.id;
-    const referralLink = buildReferralLink(firstName, lastName, contactId);
+    const referCode = buildReferralCode(firstName, lastName, contactId);
+    const referralLink = buildReferralLink(referCode);
 
     await axios.patch(
       `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
-      { properties: { referral_link: referralLink } },
+      { properties: { referral_link: referralLink, refer_code: referCode } },
       { headers: hubspotHeaders() }
     );
 
