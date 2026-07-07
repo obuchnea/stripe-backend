@@ -33,7 +33,7 @@ async function findContactByEmail(email) {
           value: email,
         }],
       }],
-      properties: ['email', 'firstname', 'lastname', 'totalindividualdonations'],
+      properties: ['email', 'firstname', 'lastname', 'totalindividualdonations', 'referral_link'],
       limit: 1,
     },
     { headers: hubspotHeaders() }
@@ -177,6 +177,107 @@ app.post('/donation-complete', async (req, res) => {
     res.json({ success: true });
   } catch (error) {
     console.error('Donation complete error:', error.response?.data || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ─── Referral link helpers ──────────────────────────────────────────────────
+
+function slugifyName(str = '') {
+  return str
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '') // strip accents
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
+    .trim();
+}
+
+function buildReferralLink(firstname, lastname, contactId) {
+  const base = `${slugifyName(firstname)}_${slugifyName(lastname)}`;
+  const suffix = contactId.slice(-4); // guards against name collisions
+  return `https://www.leefairclough.ca/member?referred_by_id=${base}_${suffix}`;
+}
+
+// findContactByEmail already exists — just add referral_link to the properties array:
+// properties: ['email', 'firstname', 'lastname', 'totalindividualdonations', 'referral_link'],
+
+// ─── Routes ──────────────────────────────────────────────────────────────────
+
+/**
+ * Step 1: check if a contact exists and whether they already have a link.
+ */
+app.post('/api/referral/lookup', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Missing email' });
+
+    const contact = await findContactByEmail(email.trim().toLowerCase());
+
+    if (!contact) {
+      return res.json({ exists: false });
+    }
+
+    // Already has a link — idempotent return, no HubSpot write, no workflow re-trigger
+    if (contact.properties.referral_link) {
+      return res.json({ exists: true, referralLink: contact.properties.referral_link });
+    }
+
+    // Contact exists but no link yet — generate and set it now
+    const referralLink = buildReferralLink(
+      contact.properties.firstname || '',
+      contact.properties.lastname || '',
+      contact.id
+    );
+
+    await axios.patch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${contact.id}`,
+      { properties: { referral_link: referralLink } },
+      { headers: hubspotHeaders() }
+    );
+
+    res.json({ exists: true, referralLink });
+  } catch (error) {
+    console.error('Referral lookup error:', error.response?.data || error.message);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * Step 2 (only if lookup returned exists:false): create the contact
+ * with the fields collected in-page, then generate the link.
+ */
+app.post('/api/referral/create', async (req, res) => {
+  try {
+    const { email, firstName, lastName, phone, postalCode } = req.body;
+    if (!email || !firstName || !lastName) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const createRes = await axios.post(
+      'https://api.hubapi.com/crm/v3/objects/contacts',
+      {
+        properties: {
+          email: email.trim().toLowerCase(),
+          firstname: firstName,
+          lastname: lastName,
+          phone: phone || '',
+          zip: postalCode || '',
+        },
+      },
+      { headers: hubspotHeaders() }
+    );
+
+    const contactId = createRes.data.id;
+    const referralLink = buildReferralLink(firstName, lastName, contactId);
+
+    await axios.patch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+      { properties: { referral_link: referralLink } },
+      { headers: hubspotHeaders() }
+    );
+
+    res.json({ referralLink });
+  } catch (error) {
+    console.error('Referral create error:', error.response?.data || error.message);
     res.status(500).json({ error: error.message });
   }
 });
