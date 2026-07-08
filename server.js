@@ -4,6 +4,7 @@ const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const cors = require('cors');
 const axios = require('axios');
 const nodemailer = require('nodemailer');
+const crypto = require('crypto');
 
 const app = express();
 app.use(express.json());
@@ -18,7 +19,7 @@ const hubspotHeaders = () => ({
   'Content-Type': 'application/json',
 });
 
-/**
+/*
  * Search HubSpot for a contact by email.
  * Returns the full contact object { id, properties } or null if not found.
  */
@@ -284,6 +285,96 @@ app.post('/api/referral/create', async (req, res) => {
   } catch (error) {
     console.error('Referral create error:', error.response?.data || error.message);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Short-lived, in-memory — no new HubSpot property needed since these
+// tokens are generated fresh per request and expire in 30 minutes
+const statsTokens = new Map(); // token -> { referCode, firstName, expiresAt }
+const TOKEN_TTL_MS = 30 * 60 * 1000;
+
+app.post('/api/referral-stats/request', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email required' });
+
+  try {
+    const searchRes = await fetch('https://api.hubapi.com/crm/v3/objects/contacts/search', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        filterGroups: [{ filters: [{ propertyName: 'email', operator: 'EQ', value: email }] }],
+        properties: ['refer_code', 'firstname']
+      })
+    });
+    const { results } = await searchRes.json();
+    const contact = results?.[0];
+
+    if (contact?.properties?.refer_code) {
+      const token = crypto.randomBytes(24).toString('hex');
+      statsTokens.set(token, {
+        referCode: contact.properties.refer_code,
+        firstName: contact.properties.firstname,
+        expiresAt: Date.now() + TOKEN_TTL_MS
+      });
+      const link = `https://leefairclough.ca/my-referrals?token=${token}`;
+      await sendStatsEmail(email, link); // reuse your existing nodemailer transporter
+    }
+
+    // Same response either way — don't confirm/deny whether the email exists
+    res.json({ message: 'If that email has a referral code, a link has been sent.' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong' });
+  }
+});
+
+async function sendStatsEmail(to, link) {
+  await transporter.sendMail({
+    from: 'campaign@leefairclough.ca',
+    to,
+    subject: 'Your Referral Stats',
+    html: `<p>Here's your referral stats link:</p><p><a href="${link}">${link}</a></p><p>Expires in 30 minutes.</p>`
+  });
+}
+
+app.get('/api/referral-stats', async (req, res) => {
+  const entry = statsTokens.get(req.query.token);
+  if (!entry || entry.expiresAt < Date.now()) {
+    return res.status(401).json({ error: 'This link has expired. Request a new one.' });
+  }
+
+  try {
+    const searchRes = await fetch('https://api.hubapi.com/crm/v3/objects/contacts/search', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.HUBSPOT_TOKEN}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        filterGroups: [{ filters: [{ propertyName: 'referred_by_id', operator: 'EQ', value: entry.referCode }] }],
+        properties: ['firstname', 'lastname', 'createdate'],
+        limit: 100
+      })
+    });
+    const { results } = await searchRes.json();
+
+    const oneWeekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const referrals = results
+      .map(c => ({ firstName: c.properties.firstname, lastName: c.properties.lastname, date: c.properties.createdate }))
+      .sort((a, b) => new Date(b.date) - new Date(a.date));
+
+    res.json({
+      firstName: entry.firstName,
+      totalReferrals: referrals.length,
+      weeklyReferrals: referrals.filter(r => new Date(r.date).getTime() >= oneWeekAgo).length,
+      referrals
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Something went wrong' });
   }
 });
 
