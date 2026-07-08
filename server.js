@@ -333,7 +333,7 @@ app.post('/api/referral-stats/request', async (req, res) => {
 
 async function sendStatsEmail(to, link) {
   await transporter.sendMail({
-    from: 'campaign@leefairclough.ca',
+    from: 'owain@syrupsystems.ca',
     to,
     subject: 'Your Referral Stats',
     html: `<p>Here's your referral stats link:</p><p><a href="${link}">${link}</a></p><p>Expires in 30 minutes.</p>`
