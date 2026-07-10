@@ -97,6 +97,7 @@ const axios        = require('axios');
 const Stripe       = require('stripe');
 const { google }   = require('googleapis');
 const { DateTime } = require('luxon');
+const readline     = require('readline/promises');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -106,6 +107,14 @@ const SHEET_TAB         = 'Summary';
 const DONORS_SHEET_TAB  = 'Donors';
 const REFUNDS_SHEET_TAB = 'Refunds';
 const TZ                = 'America/Toronto'; // handles EDT/EST automatically
+const INTERACTIVE       = process.argv.includes('--interactive') && process.stdin.isTTY;
+
+if (process.argv.includes('--interactive') && !process.stdin.isTTY) {
+  console.warn(
+    '[sync] --interactive was passed but no terminal is attached (e.g. running under cron) — ' +
+    'falling back to auto-skip for malformed emails instead of hanging.'
+  );
+}
 
 const hubspotHeaders = {
   Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`,
@@ -290,7 +299,39 @@ function isValidEmail(email) {
   return true;
 }
 
-function emailFromCharge(charge) {
+async function promptForCorrectedEmail(charge, rawEmail) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    console.log('\n──────────────────────────────────────────');
+    console.log(`⚠ Malformed email on charge ${charge.id}`);
+    console.log(`   Raw value: "${rawEmail}"`);
+    console.log(`   Amount:    $${(charge.amount / 100).toFixed(2)}`);
+    console.log(`   Name:      ${charge.billing_details?.name || '(none)'}`);
+    console.log('──────────────────────────────────────────');
+
+    while (true) {
+      const answer = (
+        await rl.question('Enter corrected email (or press Enter to skip this donor): ')
+      ).trim().toLowerCase();
+
+      if (!answer) {
+        console.log(`[sync] Skipping charge ${charge.id} — no correction provided.\n`);
+        return null;
+      }
+
+      if (isValidEmail(answer)) {
+        console.log(`[sync] Using corrected email "${answer}" for charge ${charge.id}.\n`);
+        return answer;
+      }
+
+      console.log(`"${answer}" still doesn't look valid — try again, or press Enter to skip.`);
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+async function emailFromCharge(charge, { interactive = INTERACTIVE } = {}) {
   const raw = (
     charge.billing_details?.email ||
     charge.receipt_email ||
@@ -299,19 +340,23 @@ function emailFromCharge(charge) {
 
   if (!raw) return null;
 
-  if (!isValidEmail(raw)) {
-    console.warn(`[sync] Skipping malformed email on charge ${charge.id}: "${raw}"`);
-    return null;
+  if (isValidEmail(raw)) return raw;
+
+  console.warn(`[sync] Malformed email on charge ${charge.id}: "${raw}"`);
+
+  if (interactive) {
+    return promptForCorrectedEmail(charge, raw);
   }
 
-  return raw;
+  console.warn(`[sync] Skipping charge ${charge.id} (re-run with --interactive to fix these manually).`);
+  return null;
 }
 
-function buildDonorMap(charges) {
+async function buildDonorMap(charges) {
   const donors = new Map();
 
   for (const charge of charges) {
-    const email = emailFromCharge(charge);
+    const email = await emailFromCharge(charge);
     if (!email) continue;
 
     const amount     = charge.amount / 100;
@@ -351,12 +396,12 @@ function buildDonorMap(charges) {
   return donors;
 }
 
-function buildHistoricalEmailSet(allCharges, beforeDate) {
+async function buildHistoricalEmailSet(allCharges, beforeDate) {
   const seen = new Set();
   for (const charge of allCharges) {
     const chargeDate = DateTime.fromSeconds(charge.created, { zone: TZ }).toFormat('yyyy-MM-dd');
     if (chargeDate < beforeDate) {
-      const email = emailFromCharge(charge);
+      const email = await emailFromCharge(charge, { interactive: false }); // never prompt for historical baseline
       if (email) seen.add(email);
     }
   }
@@ -423,7 +468,7 @@ async function resolveRefundEmails(stripe, refunds, chargeCache, { silent = fals
     }
 
     const charge = chargeCache.get(chargeId);
-    const email  = emailFromCharge(charge);
+    const email  = await emailFromCharge(charge);
     if (!email) {
       if (!silent) console.warn(`[refund] No valid email on charge ${chargeId} — skipping refund ${refund.id}`);
       continue;
@@ -955,7 +1000,7 @@ async function runFullBackfill(stripe, sheets) {
     const dateStr    = sortedDates[i];
     const dayCharges = chargesByDate.get(dateStr) || [];
     const dayRefunds = refundsByDate.get(dateStr) || [];
-    const donorMap   = buildDonorMap(dayCharges);
+    const donorMap   = await buildDonorMap(dayCharges);
 
     const newEmailsToday = [...donorMap.keys()].filter(e => !allTimeSeenEmails.has(e));
     newEmailsToday.forEach(e => allTimeSeenEmails.add(e));
@@ -1089,7 +1134,7 @@ async function run() {
     charges.map(c => enrichChargeAddress(stripe, c))
   );
 
-  const donorMap = buildDonorMap(enrichedCharges);
+  const donorMap = await buildDonorMap(enrichedCharges);
   console.log(`[sync] ${donorMap.size} unique donor(s) to process`);
 
   const chargeCache = new Map(charges.map((c) => [c.id, c]));
@@ -1097,7 +1142,7 @@ async function run() {
   let historicalEmailSet = new Set();
   if (sheets) {
     const allCharges = await fetchAllCharges(stripe, { silent: true });
-    historicalEmailSet = buildHistoricalEmailSet(allCharges, syncDate);
+    historicalEmailSet = await buildHistoricalEmailSet(allCharges, syncDate);
     for (const c of allCharges) {
       if (!chargeCache.has(c.id)) chargeCache.set(c.id, c);
     }
