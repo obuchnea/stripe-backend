@@ -1,9 +1,9 @@
 /**
  * sync.js — Stripe → HubSpot nightly donor sync + Google Sheets reporting
  *
- * Designed to run at 12:01 AM UTC via Railway Cron ("1 0 * * *").
+ * Designed to run at 12:01 AM EDT via Railway Cron ("1 4 * * *").
  * Each run syncs all succeeded Stripe charges from the PREVIOUS calendar day
- * (yesterday 00:00:00 UTC → 23:59:59 UTC), processes any refunds issued that
+ * (yesterday 00:00:00 EDT → 23:59:59 EDT), processes any refunds issued that
  * day, and appends one summary row to a Google Sheet:
  *
  *   Date | Daily Total ($) | Daily Donor Count | New Donors |
@@ -96,6 +96,7 @@ require('dotenv').config();
 const axios        = require('axios');
 const Stripe       = require('stripe');
 const { google }   = require('googleapis');
+const { DateTime } = require('luxon');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -104,6 +105,7 @@ const DELAY_MS          = 150;
 const SHEET_TAB         = 'Summary';
 const DONORS_SHEET_TAB  = 'Donors';
 const REFUNDS_SHEET_TAB = 'Refunds';
+const TZ                = 'America/Toronto'; // handles EDT/EST automatically
 
 const hubspotHeaders = {
   Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`,
@@ -115,7 +117,7 @@ const hubspotHeaders = {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function toHubSpotDate(unixTs) {
-  const dateOnly = new Date(unixTs * 1000).toISOString().split('T')[0];
+  const dateOnly = DateTime.fromSeconds(unixTs, { zone: TZ }).toFormat('yyyy-MM-dd');
   return new Date(`${dateOnly}T00:00:00.000Z`).getTime();
 }
 
@@ -125,16 +127,17 @@ function splitName(fullName = '') {
   return { firstname: parts[0], lastname: parts.slice(1).join(' ') };
 }
 
-function dayWindow(dateString) {
-  const windowStart = Math.floor(new Date(`${dateString}T00:00:00.000Z`).getTime() / 1000);
-  const windowEnd   = Math.floor(new Date(`${dateString}T23:59:59.999Z`).getTime() / 1000);
-  return { windowStart, windowEnd };
+function yesterdayUTC() {
+  return DateTime.now().setZone(TZ).minus({ days: 1 }).toFormat('yyyy-MM-dd');
 }
 
-function yesterdayUTC() {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() - 1);
-  return d.toISOString().split('T')[0];
+function dayWindow(dateString) {
+  const start = DateTime.fromISO(dateString, { zone: TZ }).startOf('day');
+  const end   = start.plus({ days: 1 });
+  return {
+    windowStart: Math.floor(start.toSeconds()),
+    windowEnd:   Math.floor(end.toSeconds()) - 1,
+  };
 }
 
 function resolveSyncDate() {
@@ -351,7 +354,7 @@ function buildDonorMap(charges) {
 function buildHistoricalEmailSet(allCharges, beforeDate) {
   const seen = new Set();
   for (const charge of allCharges) {
-    const chargeDate = new Date(charge.created * 1000).toISOString().split('T')[0];
+    const chargeDate = DateTime.fromSeconds(charge.created, { zone: TZ }).toFormat('yyyy-MM-dd');
     if (chargeDate < beforeDate) {
       const email = emailFromCharge(charge);
       if (email) seen.add(email);
@@ -926,14 +929,14 @@ async function runFullBackfill(stripe, sheets) {
 
   const chargesByDate = new Map();
   for (const charge of enrichedCharges) {
-    const dateStr = new Date(charge.created * 1000).toISOString().split('T')[0];
+    const dateStr = DateTime.fromSeconds(charge.created, { zone: TZ }).toFormat('yyyy-MM-dd');
     if (!chargesByDate.has(dateStr)) chargesByDate.set(dateStr, []);
     chargesByDate.get(dateStr).push(charge);
   }
 
   const refundsByDate = new Map();
   for (const refund of allRefunds) {
-    const dateStr = new Date(refund.created * 1000).toISOString().split('T')[0];
+    const dateStr = DateTime.fromSeconds(refund.created, { zone: TZ }).toFormat('yyyy-MM-dd');
     if (!refundsByDate.has(dateStr)) refundsByDate.set(dateStr, []);
     refundsByDate.get(dateStr).push(refund);
   }
