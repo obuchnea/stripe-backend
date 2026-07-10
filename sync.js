@@ -829,9 +829,11 @@ async function sendSummaryEmail(summary) {
 
   // ── Send via Resend ───────────────────────────────────────────────────────
   try {
+    const toAddresses = SUMMARY_EMAIL_TO.split(',').map(e => e.trim()).filter(Boolean);
+
     await resend.emails.send({
       from:    RESEND_FROM || 'Donations <onboarding@resend.dev>',
-      to:      SUMMARY_EMAIL_TO,
+      to:      toAddresses,
       subject: `Donation Summary — ${summary.date}`,
       html,
       attachments: [{
