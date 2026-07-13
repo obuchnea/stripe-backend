@@ -51,6 +51,46 @@ function toHubSpotDate(isoDateString) {
   return new Date(isoDateString + 'T00:00:00.000Z').getTime();
 }
 
+async function attributeDonationReferral(referCode, donationAmount) {
+  try {
+    const res = await axios.post(
+      'https://api.hubapi.com/crm/v3/objects/contacts/search',
+      {
+        filterGroups: [{
+          filters: [{ propertyName: 'refer_code', operator: 'EQ', value: referCode }],
+        }],
+        properties: ['refer_code', 'donations_referred_count', 'donations_referred_amount'],
+        limit: 1,
+      },
+      { headers: hubspotHeaders() }
+    );
+
+    const referrer = res.data.results[0];
+    if (!referrer) {
+      console.warn(`donation referral: no contact found for refer_code "${referCode}"`);
+      return;
+    }
+
+    const currentCount = parseInt(referrer.properties.donations_referred_count || 0, 10);
+    const currentAmount = parseFloat(referrer.properties.donations_referred_amount || 0);
+
+    await axios.patch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${referrer.id}`,
+      {
+        properties: {
+          donations_referred_count: currentCount + 1,
+          donations_referred_amount: parseFloat((currentAmount + donationAmount).toFixed(2)),
+        },
+      },
+      { headers: hubspotHeaders() }
+    );
+
+    console.log(`Attributed $${donationAmount} donation to referrer ${referrer.id} (${referCode})`);
+  } catch (err) {
+    console.error('Referral attribution failed:', err.response?.data || err.message);
+  }
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
@@ -130,6 +170,7 @@ app.post('/donation-complete', async (req, res) => {
     // Amount arrives in cents from Stripe; convert to dollars
     const donationAmount = parseFloat((amount / 100).toFixed(2));
     const donationDate = toHubSpotDate(new Date().toISOString().split('T')[0]);
+    const referCode = paymentIntent.metadata?.referrer_id || '';
 
     // 2. Look up existing HubSpot contact by email
     const existing = await findContactByEmail(email);
@@ -174,6 +215,10 @@ app.post('/donation-complete', async (req, res) => {
       );
 
       console.log(`Created new contact (${email}): first donation $${donationAmount}`);
+    }
+
+    if (referCode) {
+      await attributeDonationReferral(referCode, donationAmount);
     }
 
     res.json({ success: true });
