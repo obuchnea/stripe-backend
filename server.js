@@ -35,7 +35,7 @@ async function findContactByEmail(email) {
           value: email,
         }],
       }],
-      properties: ['email', 'firstname', 'lastname', 'totalindividualdonations', 'referral_link', 'refer_code'],
+      properties: ['email', 'firstname', 'lastname', 'totalindividualdonations', 'referral_link', 'refer_code', 'referred_by_id'],
       limit: 1,
     },
     { headers: hubspotHeaders() }
@@ -176,41 +176,50 @@ app.post('/donation-complete', async (req, res) => {
     const existing = await findContactByEmail(email);
 
     if (existing) {
-      // 3a. Contact exists — increment their running total
       const currentTotal = parseFloat(existing.properties.totalindividualdonations || 0);
       const newTotal = parseFloat((currentTotal + donationAmount).toFixed(2));
 
+      const properties = {
+        firstname: firstName,
+        lastname: lastName,
+        totalindividualdonations: newTotal,
+        last_donation_amount: donationAmount,
+        latest_donation_date: donationDate,
+        is_donor: true,
+      };
+
+      // Only set referred_by_id if they don't already have one — preserves
+      // whoever referred them first (e.g. via the membership flow) instead
+      // of letting a later donation link overwrite it.
+      if (referCode && !existing.properties.referred_by_id) {
+        properties.referred_by_id = referCode;
+      }
+
       await axios.patch(
         `https://api.hubapi.com/crm/v3/objects/contacts/${existing.id}`,
-        {
-          properties: {
-            firstname: firstName,
-            lastname: lastName,
-            totalindividualdonations: newTotal,
-            last_donation_amount: donationAmount,
-            latest_donation_date: donationDate,
-            is_donor: true,
-          },
-        },
+        { properties },
         { headers: hubspotHeaders() }
       );
 
       console.log(`Updated contact ${existing.id} (${email}): total now $${newTotal}`);
     } else {
-      // 3b. New donor — create contact, first donation = total
+      const properties = {
+        email,
+        firstname: firstName,
+        lastname: lastName,
+        totalindividualdonations: donationAmount,
+        last_donation_amount: donationAmount,
+        latest_donation_date: donationDate,
+        is_donor: true,
+      };
+
+      if (referCode) {
+        properties.referred_by_id = referCode;
+      }
+
       await axios.post(
         'https://api.hubapi.com/crm/v3/objects/contacts',
-        {
-          properties: {
-            email,
-            firstname: firstName,
-            lastname: lastName,
-            totalindividualdonations: donationAmount,
-            last_donation_amount: donationAmount,
-            latest_donation_date: donationDate,
-            is_donor: true,
-          },
-        },
+        { properties },
         { headers: hubspotHeaders() }
       );
 
