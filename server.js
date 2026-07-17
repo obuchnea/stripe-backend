@@ -425,9 +425,6 @@ app.post('/api/referral/lookup', async (req, res) => {
       // await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
       //   referralLink: contact.properties.referral_link, donationReferralLink, sheetUrl,
       // });
-      await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
-        referralLink: contact.properties.referral_link, donationReferralLink,
-      });
 
       // return res.json({
       //   exists: true,
@@ -474,9 +471,6 @@ app.post('/api/referral/lookup', async (req, res) => {
     // await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
     //   referralLink, donationReferralLink, sheetUrl,
     // });
-    await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
-      referralLink, donationReferralLink,
-    });
 
     // res.json({ exists: true, referralLink, donationReferralLink, sheetUrl });
     res.json({ exists: true, referralLink, donationReferralLink });
@@ -534,7 +528,6 @@ app.post('/api/referral/create', async (req, res) => {
     }
 
     // await sendReferralEmail(trimmedEmail, firstName, { referralLink, donationReferralLink, sheetUrl });
-    await sendReferralEmail(trimmedEmail, firstName, { referralLink, donationReferralLink });
 
     // res.json({ referralLink, donationReferralLink, sheetUrl });
     res.json({ referralLink, donationReferralLink });
