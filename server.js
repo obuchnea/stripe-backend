@@ -334,17 +334,26 @@ async function sendReferralEmail(email, firstName, { referralLink, donationRefer
   const { Resend } = require('resend');
   const resend = new Resend(RESEND_API_KEY);
 
-  const sheetRow = sheetUrl
-    ? `<p><strong>Your referral stats:</strong><br><a href="${sheetUrl}">${sheetUrl}</a></p>
-       <p style="font-size:12px;color:#888;">The stats sheet requires signing in with a Google account matching this email address.</p>`
-    : '';
+  // const sheetRow = sheetUrl
+  //   ? `<p><strong>Your referral stats:</strong><br><a href="${sheetUrl}">${sheetUrl}</a></p>
+  //      <p style="font-size:12px;color:#888;">The stats sheet requires signing in with a Google account matching this email address.</p>`
+  //   : '';
+
+  // const html = `
+  //   <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:0 auto;">
+  //     <h2 style="color:#960018;">Thanks${firstName ? `, ${firstName}` : ''}! Here are your referral links.</h2>
+  //     <p><strong>Membership referral link:</strong><br><a href="${referralLink}">${referralLink}</a></p>
+  //     <p><strong>Donation referral link:</strong><br><a href="${donationReferralLink}">${donationReferralLink}</a></p>
+  //     ${sheetRow}
+  //     <p style="font-size:12px;color:#888;margin-top:16px;">Share these with friends and family to help grow the campaign.</p>
+  //   </div>
+  // `;
 
   const html = `
     <div style="font-family:Helvetica,Arial,sans-serif;max-width:560px;margin:0 auto;">
       <h2 style="color:#960018;">Thanks${firstName ? `, ${firstName}` : ''}! Here are your referral links.</h2>
       <p><strong>Membership referral link:</strong><br><a href="${referralLink}">${referralLink}</a></p>
       <p><strong>Donation referral link:</strong><br><a href="${donationReferralLink}">${donationReferralLink}</a></p>
-      ${sheetRow}
       <p style="font-size:12px;color:#888;margin-top:16px;">Share these with friends and family to help grow the campaign.</p>
     </div>
   `;
@@ -383,13 +392,14 @@ app.post('/api/referral/lookup', async (req, res) => {
     // Already fully set up — idempotent, but still (re)send the email as a
     // convenience in case they lost their original links.
     if (contact.properties.referral_link && contact.properties.refer_code) {
-      let sheetUrl = contact.properties.referral_sheet_url;
+      // let sheetUrl = contact.properties.referral_sheet_url;
 
       // Backfill: link predates the per-referrer sheet feature, or the
       // sheet failed to create last time.
-      if (!sheetUrl) {
-        sheetUrl = await createAndAttachSheet(contact);
-      }
+      
+      // if (!sheetUrl) {
+      //   sheetUrl = await createAndAttachSheet(contact);
+      // }
 
       const donationReferralLink = contact.properties.donation_referral_link
         || buildDonationReferralLink(contact.properties.refer_code);
@@ -408,11 +418,18 @@ app.post('/api/referral/lookup', async (req, res) => {
         referralLink: contact.properties.referral_link, donationReferralLink, sheetUrl,
       });
 
+      // return res.json({
+      //   exists: true,
+      //   referralLink: contact.properties.referral_link,
+      //   donationReferralLink,
+      //   sheetUrl,
+      // });
+
+      
       return res.json({
         exists: true,
         referralLink: contact.properties.referral_link,
         donationReferralLink,
-        sheetUrl,
       });
     }
 
@@ -427,17 +444,21 @@ app.post('/api/referral/lookup', async (req, res) => {
     const referralLink = buildReferralLink(referCode);
     const donationReferralLink = buildDonationReferralLink(referCode);
 
-    const sheetUrl = await createAndAttachSheet(contact, {
-      refer_code: referCode,
-      referral_link: referralLink,
-      donation_referral_link: donationReferralLink,
-    });
+    // const sheetUrl = await createAndAttachSheet(contact, {
+    //   refer_code: referCode,
+    //   referral_link: referralLink,
+    //   donation_referral_link: donationReferralLink,
+    // });
 
+    // await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
+    //   referralLink, donationReferralLink, sheetUrl,
+    // });
     await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
-      referralLink, donationReferralLink, sheetUrl,
+      referralLink, donationReferralLink,
     });
 
-    res.json({ exists: true, referralLink, donationReferralLink, sheetUrl });
+    // res.json({ exists: true, referralLink, donationReferralLink, sheetUrl });
+    res.json({ exists: true, referralLink, donationReferralLink });
   } catch (error) {
     console.error('Referral lookup error:', error.response?.data || error.message);
     res.status(500).json({ error: error.message });
@@ -476,14 +497,16 @@ app.post('/api/referral/create', async (req, res) => {
     const referralLink = buildReferralLink(referCode);
     const donationReferralLink = buildDonationReferralLink(referCode);
 
-    const sheetUrl = await createAndAttachSheet(
-      { id: contactId, properties: { email: trimmedEmail, firstname: firstName, lastname: lastName } },
-      { refer_code: referCode, referral_link: referralLink, donation_referral_link: donationReferralLink }
-    );
+    // const sheetUrl = await createAndAttachSheet(
+    //   { id: contactId, properties: { email: trimmedEmail, firstname: firstName, lastname: lastName } },
+    //   { refer_code: referCode, referral_link: referralLink, donation_referral_link: donationReferralLink }
+    // );
 
-    await sendReferralEmail(trimmedEmail, firstName, { referralLink, donationReferralLink, sheetUrl });
+    // await sendReferralEmail(trimmedEmail, firstName, { referralLink, donationReferralLink, sheetUrl });
+    await sendReferralEmail(trimmedEmail, firstName, { referralLink, donationReferralLink });
 
-    res.json({ referralLink, donationReferralLink, sheetUrl });
+    // res.json({ referralLink, donationReferralLink, sheetUrl });
+    res.json({ referralLink, donationReferralLink });
   } catch (error) {
     console.error('Referral create error:', error.response?.data || error.message);
     res.status(500).json({ error: error.message });
