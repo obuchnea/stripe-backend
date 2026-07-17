@@ -52,6 +52,14 @@
  *     - Attribution is never stored on the HubSpot contact — it lives only
  *       in the Donors sheet tab, queryable via SUMIF or a pivot table.
  *
+ *   PER-REFERRER SHEETS: on top of the shared Donors tab above, each night
+ *   this script also calls into referralAttribution.js, which fans referred
+ *   donations AND referred membership signups out into each individual
+ *   referrer's own Google Sheet (created on demand — see referralSheets.js /
+ *   the /api/referral/* routes in server.js), and refreshes their
+ *   leaderboard position there. That step is independent of GOOGLE_SHEET_ID
+ *   and runs even if the master admin sheet isn't configured.
+ *
  * No .last_sync file is used — the time window is always deterministic
  * (yesterday), so every run is idempotent and self-contained.
  *
@@ -80,6 +88,7 @@
  * OPTIONAL ENV VARS — omit to skip the relevant feature:
  *   GOOGLE_SHEET_ID                 — ID from the sheet URL
  *   GOOGLE_SERVICE_ACCOUNT_JSON     — full contents of the service account key JSON
+ *   GOOGLE_SHARED_DRIVE_ID          — Shared Drive ID for per-referrer sheets (see SETUP.md)
  *   RESEND_API_KEY                  — API key from resend.com
  *   RESEND_FROM                     — verified sender address (e.g. Donations <you@yourdomain.com>)
  *   SUMMARY_EMAIL_TO                — recipient address for the daily summary email
@@ -89,7 +98,7 @@
  *   node sync.js --date 2025-06-01      → syncs a specific date
  *
  * DEPENDENCIES:
- *   npm install dotenv axios stripe googleapis resend
+ *   npm install dotenv axios stripe googleapis luxon resend
  */
 
 require('dotenv').config();
@@ -98,6 +107,7 @@ const Stripe       = require('stripe');
 const { google }   = require('googleapis');
 const { DateTime } = require('luxon');
 const readline     = require('readline/promises');
+const referralAttribution = require('./referralAttribution');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -106,6 +116,7 @@ const DELAY_MS          = 150;
 const SHEET_TAB         = 'Summary';
 const DONORS_SHEET_TAB  = 'Donors';
 const REFUNDS_SHEET_TAB = 'Refunds';
+const RIDINGS_SHEET_TAB = 'Ridings';
 const TZ                = 'America/Toronto'; // handles EDT/EST automatically
 const INTERACTIVE       = process.argv.includes('--interactive') && process.stdin.isTTY;
 
@@ -287,6 +298,7 @@ async function enrichChargeAddress(stripe, charge) {
     }
   }
 
+  enriched._alreadySynced = enriched.payment_intent?.metadata?.hubspot_synced === 'true';
   enriched._customerPhone = phone;
   enriched._referrerId    = referrerId;
   return enriched;
@@ -359,16 +371,20 @@ async function buildDonorMap(charges) {
     const email = await emailFromCharge(charge);
     if (!email) continue;
 
-    const amount     = charge.amount / 100;
-    const created    = charge.created;
-    const cardName   = charge.billing_details?.name || '';
-    const address    = charge.payment_method?.billing_details?.address || charge.billing_details?.address || {};
-    const phone      = charge._customerPhone || charge.billing_details?.phone || '';
-    const referrerId = charge._referrerId || '';
+    const amount        = charge.amount / 100;
+    const alreadySynced = charge._alreadySynced === true;
+    const created       = charge.created;
+    const cardName      = charge.billing_details?.name || '';
+    const address       = charge.payment_method?.billing_details?.address || charge.billing_details?.address || {};
+    const phone         = charge._customerPhone || charge.billing_details?.phone || '';
+    const referrerId    = charge._referrerId || '';
 
     if (donors.has(email)) {
       const d = donors.get(email);
       d.totalAmount = parseFloat((d.totalAmount + amount).toFixed(2));
+      if (!alreadySynced) {
+        d.unsyncedAmount = parseFloat((d.unsyncedAmount + amount).toFixed(2));
+      }
       if (created > d.latestCreated) {
         d.latestCreated = created;
         d.latestAmount  = amount;
@@ -376,12 +392,12 @@ async function buildDonorMap(charges) {
         d.id            = charge.id;
         d.address       = address;
         d.phone         = phone;
-        // Update referrer to the one on the most recent charge; keep existing if new charge has none
         d.referrerId    = referrerId || d.referrerId;
       }
     } else {
       donors.set(email, {
         totalAmount: amount,
+        unsyncedAmount: alreadySynced ? 0 : amount,
         latestCreated: created,
         latestAmount: amount,
         cardName,
@@ -495,7 +511,7 @@ async function findContactByEmail(email) {
       filterGroups: [{
         filters: [{ propertyName: 'email', operator: 'EQ', value: email }],
       }],
-      properties: ['email', 'totalindividualdonations', 'is_donor'],
+      properties: ['email', 'totalindividualdonations', 'is_donor', 'zip'],
       limit: 1,
     },
     { headers: hubspotHeaders }
@@ -504,7 +520,7 @@ async function findContactByEmail(email) {
 }
 
 async function upsertContact(email, donor) {
-  const { totalAmount, latestCreated, latestAmount, cardName } = donor;
+  const { totalAmount, unsyncedAmount, latestCreated, latestAmount, cardName } = donor;
   const { firstname, lastname } = splitName(cardName);
   const hubspotDate = toHubSpotDate(latestCreated);
 
@@ -513,10 +529,10 @@ async function upsertContact(email, donor) {
 
   let newTotal;
   if (!existing) {
-    newTotal = totalAmount;
+    newTotal = unsyncedAmount;
   } else {
     const currentTotal = parseFloat(existing.properties.totalindividualdonations || 0);
-    newTotal = parseFloat((currentTotal + totalAmount).toFixed(2));
+    newTotal = parseFloat((currentTotal + unsyncedAmount).toFixed(2));
   }
 
   const props = {
@@ -569,6 +585,232 @@ async function applyRefundToContact(email, refundAmount) {
     action:   isFullRefund ? 'fully_refunded' : 'partially_refunded',
     newTotal,
   };
+}
+
+/**
+ * Fetch every contact that has the properties we need, paginated via `after`.
+ * No filtering here — we skip contacts with a blank `riding` later, once
+ * we're grouping, so this stays a single reusable fetch.
+ */
+async function fetchAllContactsForRidings() {
+  const contacts = [];
+  let after;
+
+  console.log('[ridings] Fetching all HubSpot contacts...');
+
+  do {
+    const params = {
+      limit: 100,
+      properties: 'riding,is_volunteer,is_donor,totalindividualdonations,createdate,email',
+    };
+    if (after) params.after = after;
+
+    const res = await axios.get(`${HUBSPOT_BASE}/crm/v3/objects/contacts`, {
+      headers: hubspotHeaders,
+      params,
+    });
+
+    contacts.push(...res.data.results);
+    after = res.data.paging?.next?.after;
+
+    await sleep(DELAY_MS);
+  } while (after);
+
+  console.log(`[ridings] ${contacts.length} contact(s) fetched.`);
+  return contacts;
+}
+
+/**
+ * Batch-fetch is_volunteer/is_donor property history for a list of contact
+ * IDs (100 per HubSpot batch/read call). Only call this with IDs for
+ * contacts that are CURRENTLY true on at least one of the two properties —
+ * no point paying for history on someone who was never a volunteer/donor.
+ *
+ * Returns Map<contactId, { is_volunteer: [...history entries], is_donor: [...] }>
+ */
+async function fetchPropertyHistoryBatch(contactIds) {
+  const results = new Map();
+  const BATCH_SIZE = 100;
+
+  for (let i = 0; i < contactIds.length; i += BATCH_SIZE) {
+    const batchIds = contactIds.slice(i, i + BATCH_SIZE);
+    if (batchIds.length === 0) continue;
+
+    const res = await axios.post(
+      `${HUBSPOT_BASE}/crm/v3/objects/contacts/batch/read`,
+      {
+        inputs: batchIds.map((id) => ({ id })),
+        properties: ['is_volunteer', 'is_donor'],
+        propertiesWithHistory: ['is_volunteer', 'is_donor'],
+      },
+      { headers: hubspotHeaders }
+    );
+
+    for (const contact of res.data.results) {
+      results.set(contact.id, contact.propertiesWithHistory || {});
+    }
+
+    await sleep(DELAY_MS);
+  }
+
+  return results;
+}
+
+/**
+ * Given a property's history entries (unordered), find the timestamp of the
+ * MOST RECENT false→true transition. Handles multiple flips (e.g. donor
+ * refunded to $0, then donates again later) by walking chronologically and
+ * remembering the last time the value flipped up. Returns null if the
+ * property was never true.
+ */
+function getMostRecentTrueTransitionTimestamp(historyEntries) {
+  if (!historyEntries || historyEntries.length === 0) return null;
+
+  const sorted = [...historyEntries].sort(
+    (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
+  );
+
+  let lastTransitionTs = null;
+  let prevWasTrue = false;
+
+  for (const entry of sorted) {
+    const isTrue = String(entry.value).toLowerCase() === 'true';
+    if (isTrue && !prevWasTrue) {
+      lastTransitionTs = entry.timestamp;
+    }
+    prevWasTrue = isTrue;
+  }
+
+  return lastTransitionTs;
+}
+
+function emptyRidingRow() {
+  return {
+    totalContacts: 0,
+    newContactsPastMonth: 0,
+    newContactsYesterday: 0,
+    totalVolunteers: 0,
+    newVolunteersPastMonth: 0,
+    newVolunteersYesterday: 0,
+    totalDonors: 0,
+    newDonorsPastMonth: 0,
+    newDonorsYesterday: 0,
+    totalDonations: 0,
+    newDonationsPastMonth: 0,
+    newDonationsYesterday: 0,
+  };
+}
+
+/** Trailing 30-day window ending at the end of syncDate (inclusive). */
+function pastMonthWindow(syncDate) {
+  const end = DateTime.fromISO(syncDate, { zone: TZ }).endOf('day');
+  const start = end.minus({ days: 29 }).startOf('day');
+  return { start, end };
+}
+
+/**
+ * Full nightly recompute of every riding's row. Pulls all HubSpot contacts
+ * + a month of Stripe charges, and returns Map<ridingName, rowObject>.
+ */
+async function buildRidingsData(stripe, syncDate) {
+  const { windowStart: yStart, windowEnd: yEnd } = dayWindow(syncDate);
+  const yStartDT = DateTime.fromSeconds(yStart, { zone: TZ });
+  const yEndDT   = DateTime.fromSeconds(yEnd, { zone: TZ });
+  const { start: pmStart, end: pmEnd } = pastMonthWindow(syncDate);
+
+  const contacts = await fetchAllContactsForRidings();
+
+  const ridings = new Map();
+  const emailToRiding = new Map();
+  const historyCandidateIds = [];
+
+  // ── Pass 1: totals, new contacts, and collect who needs history lookup ──
+  for (const contact of contacts) {
+    const props = contact.properties;
+    const riding = (props.riding || '').trim();
+    if (!riding) continue; // no riding on file — not counted anywhere
+
+    if (!ridings.has(riding)) ridings.set(riding, emptyRidingRow());
+    const row = ridings.get(riding);
+
+    row.totalContacts++;
+
+    const isVolunteer = props.is_volunteer === 'true' || props.is_volunteer === true;
+    const isDonor      = props.is_donor === 'true' || props.is_donor === true;
+    const donationTotal = parseFloat(props.totalindividualdonations || 0);
+
+    if (isVolunteer) row.totalVolunteers++;
+    if (isDonor)      row.totalDonors++;
+    row.totalDonations = parseFloat((row.totalDonations + donationTotal).toFixed(2));
+
+    if (props.createdate) {
+      const created = DateTime.fromISO(props.createdate, { zone: 'utc' }).setZone(TZ);
+      if (created >= pmStart && created <= pmEnd) row.newContactsPastMonth++;
+      if (created >= yStartDT && created <= yEndDT) row.newContactsYesterday++;
+    }
+
+    if (props.email) emailToRiding.set(props.email.toLowerCase().trim(), riding);
+    if (isVolunteer || isDonor) historyCandidateIds.push(contact.id);
+  }
+
+  // ── Pass 2: new volunteers / new donors via property-history transitions ─
+  console.log(`[ridings] Checking property history for ${historyCandidateIds.length} contact(s)...`);
+  const historyMap = await fetchPropertyHistoryBatch(historyCandidateIds);
+
+  for (const contact of contacts) {
+    const props = contact.properties;
+    const riding = (props.riding || '').trim();
+    if (!riding) continue;
+
+    const history = historyMap.get(contact.id);
+    if (!history) continue;
+
+    const row = ridings.get(riding);
+    const isVolunteer = props.is_volunteer === 'true' || props.is_volunteer === true;
+    const isDonor      = props.is_donor === 'true' || props.is_donor === true;
+
+    if (isVolunteer) {
+      const ts = getMostRecentTrueTransitionTimestamp(history.is_volunteer);
+      if (ts) {
+        const dt = DateTime.fromISO(ts, { zone: 'utc' }).setZone(TZ);
+        if (dt >= pmStart && dt <= pmEnd) row.newVolunteersPastMonth++;
+        if (dt >= yStartDT && dt <= yEndDT) row.newVolunteersYesterday++;
+      }
+    }
+
+    if (isDonor) {
+      const ts = getMostRecentTrueTransitionTimestamp(history.is_donor);
+      if (ts) {
+        const dt = DateTime.fromISO(ts, { zone: 'utc' }).setZone(TZ);
+        if (dt >= pmStart && dt <= pmEnd) row.newDonorsPastMonth++;
+        if (dt >= yStartDT && dt <= yEndDT) row.newDonorsYesterday++;
+      }
+    }
+  }
+
+  // ── Pass 3: donation dollars in-window, from actual Stripe charges ───────
+  console.log('[ridings] Fetching Stripe charges for the past-month window...');
+  const pmCharges = await fetchChargesForDay(
+    stripe,
+    Math.floor(pmStart.toSeconds()),
+    Math.floor(pmEnd.toSeconds())
+  ); // fetchChargesForDay just takes a window — reused as-is, no new Stripe call needed
+
+  for (const charge of pmCharges) {
+    const email = await emailFromCharge(charge, { interactive: false });
+    if (!email || !emailToRiding.has(email)) continue;
+
+    const riding = emailToRiding.get(email);
+    const row    = ridings.get(riding);
+    const amount = charge.amount / 100;
+
+    row.newDonationsPastMonth = parseFloat((row.newDonationsPastMonth + amount).toFixed(2));
+    if (charge.created >= yStart && charge.created <= yEnd) {
+      row.newDonationsYesterday = parseFloat((row.newDonationsYesterday + amount).toFixed(2));
+    }
+  }
+
+  return ridings;
 }
 
 // ─── Google Sheets ─────────────────────────────────────────────────────────
@@ -707,10 +949,45 @@ async function ensureRefundsHeader(sheets) {
   }
 }
 
+async function ensureRidingsHeader(sheets) {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${RIDINGS_SHEET_TAB}!A1:M1`,
+  });
+
+  const firstRow = res.data.values?.[0];
+  if (!firstRow || firstRow.length === 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${RIDINGS_SHEET_TAB}!A1:M1`, // fixed — was REFUNDS_SHEET_TAB
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [[
+          'Riding',
+          'Total Contacts',
+          'New Contacts - Past Month',
+          'New Contacts - Yesterday',
+          'Total Volunteers',
+          'New Volunteers - Past Month',
+          'New Volunteers - Yesterday',
+          'Total Donors',
+          'New Donors - Past Month',
+          'New Donors - Yesterday',
+          'Total Donations ($)',
+          'New Donations - Past Month ($)',
+          'New Donations - Yesterday ($)',
+        ]],
+      },
+    });
+    console.log('[sheets] Ridings header row written.');
+  }
+}
+
 async function ensureSheetHeaders(sheets) {
   await ensureSummaryHeader(sheets);
   await ensureDonorsHeader(sheets);
   await ensureRefundsHeader(sheets);
+  await ensureRidingsHeader(sheets);
 }
 
 /**
@@ -801,6 +1078,51 @@ async function getSheetsClientOrNull() {
     console.warn(`[sheets] Could not authenticate — skipping sheet updates. (${err.message})`);
     return null;
   }
+}
+
+/**
+ * Clears every existing data row (everything below the header) and rewrites
+ * the tab fresh. This is intentional, not a shortcut — Ridings is a snapshot,
+ * so patching individual rows in place would let stale ridings linger and
+ * risks numbers drifting if a riding is ever renamed in HubSpot.
+ */
+async function writeRidingsSheet(sheets, ridingsMap) {
+  const sortedRidings = [...ridingsMap.keys()].sort();
+
+  const rows = sortedRidings.map((riding) => {
+    const r = ridingsMap.get(riding);
+    return [
+      riding,
+      r.totalContacts,
+      r.newContactsPastMonth,
+      r.newContactsYesterday,
+      r.totalVolunteers,
+      r.newVolunteersPastMonth,
+      r.newVolunteersYesterday,
+      r.totalDonors,
+      r.newDonorsPastMonth,
+      r.newDonorsYesterday,
+      r.totalDonations,
+      r.newDonationsPastMonth,
+      r.newDonationsYesterday,
+    ];
+  });
+
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: process.env.GOOGLE_SHEET_ID,
+    range: `${RIDINGS_SHEET_TAB}!A2:M`,
+  });
+
+  if (rows.length > 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: process.env.GOOGLE_SHEET_ID,
+      range: `${RIDINGS_SHEET_TAB}!A2`,
+      valueInputOption: 'RAW',
+      requestBody: { values: rows },
+    });
+  }
+
+  console.log(`[sheets] Ridings tab rewritten — ${rows.length} riding(s).`);
 }
 
 // ─── Email ─────────────────────────────────────────────────────────────────
@@ -950,6 +1272,10 @@ async function processDayRefunds(stripe, windowStart, windowEnd, dateStr, charge
 async function runFullBackfill(stripe, sheets) {
   console.log('\n[backfill] Sheet is empty — running full historical backfill.');
   console.log('[backfill] This will populate HubSpot and the sheet with all-time data.\n');
+  console.log('[backfill] NOTE: per-referrer Google Sheets are NOT populated during backfill —');
+  console.log('[backfill] only the nightly/--date path calls referralAttribution.js. Referrers');
+  console.log('[backfill] onboarded after this feature shipped will pick up new activity fine;');
+  console.log('[backfill] pre-existing historical referrals won\'t retroactively appear.\n');
 
   const [allCharges, allRefunds] = await Promise.all([
     fetchAllCharges(stripe),
@@ -1105,6 +1431,20 @@ async function runFullBackfill(stripe, sheets) {
 
 // ─── Main ──────────────────────────────────────────────────────────────────
 
+/**
+ * Never throws — a Ridings failure shouldn't take down the donor sync.
+ * syncDate is the date being processed ("yesterday" on a normal nightly
+ * run, or the --date value during a manual backfill).
+ */
+async function syncRidingsTab(stripe, sheets, syncDate) {
+  try {
+    const ridingsData = await buildRidingsData(stripe, syncDate);
+    await writeRidingsSheet(sheets, ridingsData);
+  } catch (err) {
+    console.warn(`[ridings] Skipped — ${err.response?.data?.message || err.message}`);
+  }
+}
+
 async function run() {
   if (!process.env.HUBSPOT_ACCESS_TOKEN) throw new Error('HUBSPOT_ACCESS_TOKEN not set in .env');
   if (!process.env.STRIPE_SECRET_KEY)    throw new Error('STRIPE_SECRET_KEY not set in .env');
@@ -1239,6 +1579,18 @@ async function run() {
 
   if (refundFailed > 0) {
     console.warn(`[sync] ${refundFailed} refund failure(s) — re-run with --date ${syncDate} to retry.`);
+  }
+
+  // ── Per-referrer Google Sheets ────────────────────────────────────────────
+  // Independent of GOOGLE_SHEET_ID / the master admin sheet above — runs
+  // whenever HubSpot + Stripe are configured. Fans the day's referred
+  // donations (donorRows, which only contains successfully-upserted donors)
+  // and referred membership signups out into each referrer's own sheet, and
+  // refreshes leaderboard positions. Never throws.
+  await referralAttribution.syncReferrerSheetsForDay(syncDate, donorRows);
+
+  if (sheets) {
+    await syncRidingsTab(stripe, sheets, syncDate);
   }
 
   return { created, updated, failed, dailyRefundTotal, dailyRefundCount, refundFailed };
