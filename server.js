@@ -528,6 +528,7 @@ app.post('/api/referral/create', async (req, res) => {
     }
 
     // await sendReferralEmail(trimmedEmail, firstName, { referralLink, donationReferralLink, sheetUrl });
+    console.log('Test');
 
     // res.json({ referralLink, donationReferralLink, sheetUrl });
     res.json({ referralLink, donationReferralLink });
