@@ -97,6 +97,14 @@ async function attributeDonationReferral(referCode, donationAmount) {
   }
 }
 
+async function patchReferralProperties(contactId, properties) {
+  await axios.patch(
+    `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+    { properties },
+    { headers: hubspotHeaders() }
+  );
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get('/', (req, res) => {
@@ -389,6 +397,14 @@ app.post('/api/referral/lookup', async (req, res) => {
       return res.json({ exists: false });
     }
 
+    const referCode = buildReferralCode(
+      contact.properties.firstname || '',
+      contact.properties.lastname || '',
+      contact.id
+    );
+    const referralLink = buildReferralLink(referCode);
+    const donationReferralLink = buildDonationReferralLink(referCode);
+
     // Already fully set up — idempotent, but still (re)send the email as a
     // convenience in case they lost their original links.
     if (contact.properties.referral_link && contact.properties.refer_code) {
@@ -450,6 +466,16 @@ app.post('/api/referral/lookup', async (req, res) => {
     //   donation_referral_link: donationReferralLink,
     // });
 
+    try {
+      await patchReferralProperties(contact.id, {
+        refer_code: referCode,
+        referral_link: referralLink,
+        donation_referral_link: donationReferralLink,
+      });
+    } catch (err) {
+      console.error(`Could not save referral properties for ${contact.id}:`, err.response?.data || err.message);
+    }
+
     // await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
     //   referralLink, donationReferralLink, sheetUrl,
     // });
@@ -501,6 +527,16 @@ app.post('/api/referral/create', async (req, res) => {
     //   { id: contactId, properties: { email: trimmedEmail, firstname: firstName, lastname: lastName } },
     //   { refer_code: referCode, referral_link: referralLink, donation_referral_link: donationReferralLink }
     // );
+
+    try {
+      await patchReferralProperties(contactId, {
+        refer_code: referCode,
+        referral_link: referralLink,
+        donation_referral_link: donationReferralLink,
+      });
+    } catch (err) {
+      console.error(`Could not save referral properties for ${contactId}:`, err.response?.data || err.message);
+    }
 
     // await sendReferralEmail(trimmedEmail, firstName, { referralLink, donationReferralLink, sheetUrl });
     await sendReferralEmail(trimmedEmail, firstName, { referralLink, donationReferralLink });
