@@ -397,14 +397,6 @@ app.post('/api/referral/lookup', async (req, res) => {
       return res.json({ exists: false });
     }
 
-    const referCode = buildReferralCode(
-      contact.properties.firstname || '',
-      contact.properties.lastname || '',
-      contact.id
-    );
-    const referralLink = buildReferralLink(referCode);
-    const donationReferralLink = buildDonationReferralLink(referCode);
-
     // Already fully set up — idempotent, but still (re)send the email as a
     // convenience in case they lost their original links.
     if (contact.properties.referral_link && contact.properties.refer_code) {
@@ -430,8 +422,11 @@ app.post('/api/referral/lookup', async (req, res) => {
         );
       }
 
+      // await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
+      //   referralLink: contact.properties.referral_link, donationReferralLink, sheetUrl,
+      // });
       await sendReferralEmail(contact.properties.email, contact.properties.firstname, {
-        referralLink: contact.properties.referral_link, donationReferralLink, sheetUrl,
+        referralLink: contact.properties.referral_link, donationReferralLink,
       });
 
       // return res.json({
