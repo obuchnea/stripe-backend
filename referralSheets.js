@@ -184,8 +184,7 @@ async function readDataRows(sheetId, tab, colRange) {
     spreadsheetId: sheetId,
     range: `${tab}!${colRange}`,
   });
-  const rows = res.data.values || [];
-  return rows.slice(1); // drop header row
+  return res.data.values || [];
 }
 
 function countSince(rows, dateColIndex, sinceDate, dateFormat) {
