@@ -16,6 +16,61 @@ app.use(referralStatsRouter);
 
 // ─── HubSpot helpers ─────────────────────────────────────────────────────────
 
+let formsCache = { data: null, expiresAt: 0 };
+const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function fetchAllHubSpotForms() {
+  const results = [];
+  let after = undefined;
+
+  do {
+    const url = new URL('https://api.hubapi.com/marketing/v3/forms/');
+    url.searchParams.set('limit', '100');
+    if (after) url.searchParams.set('after', after);
+
+    const res = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${process.env.HUBSPOT_FORMS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`HubSpot Forms API error ${res.status}: ${errText}`);
+    }
+
+    const json = await res.json();
+    results.push(...json.results);
+    after = json.paging?.next?.after;
+  } while (after);
+
+  return results;
+}
+
+app.get('/api/event-forms', async (req, res) => {
+  try {
+    const now = Date.now();
+
+    if (!formsCache.data || now > formsCache.expiresAt) {
+      const allForms = await fetchAllHubSpotForms();
+
+      const eventForms = allForms
+        .filter(f => f.name.toUpperCase().startsWith('EVENT'))
+        .filter(f => !f.archived)
+        .map(f => ({ id: f.id, name: f.name }))
+        .sort((a, b) => a.name.localeCompare(b.name));
+
+      formsCache = { data: eventForms, expiresAt: now + CACHE_TTL_MS };
+    }
+
+    res.json(formsCache.data);
+  } catch (err) {
+    console.error('Failed to fetch event forms:', err);
+    res.status(500).json({ error: 'Could not load event list' });
+  }
+});
+
 const hubspotHeaders = () => ({
   Authorization: `Bearer ${process.env.HUBSPOT_ACCESS_TOKEN}`,
   'Content-Type': 'application/json',
