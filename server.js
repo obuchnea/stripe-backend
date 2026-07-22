@@ -48,23 +48,23 @@ async function fetchAllHubSpotForms() {
   return results;
 }
 
+async function getCachedEventForms() {
+  const now = Date.now();
+  if (!formsCache.data || now > formsCache.expiresAt) {
+    const allForms = await fetchAllHubSpotForms();
+    const eventForms = allForms
+      .filter(f => f.name.toUpperCase().startsWith('EVENT'))
+      .filter(f => !f.archived)
+      .map(f => ({ id: f.id, name: f.name }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    formsCache = { data: eventForms, expiresAt: now + CACHE_TTL_MS };
+  }
+  return formsCache.data;
+}
+
 app.get('/api/event-forms', async (req, res) => {
   try {
-    const now = Date.now();
-
-    if (!formsCache.data || now > formsCache.expiresAt) {
-      const allForms = await fetchAllHubSpotForms();
-
-      const eventForms = allForms
-        .filter(f => f.name.toUpperCase().startsWith('EVENT'))
-        .filter(f => !f.archived)
-        .map(f => ({ id: f.id, name: f.name }))
-        .sort((a, b) => a.name.localeCompare(b.name));
-
-      formsCache = { data: eventForms, expiresAt: now + CACHE_TTL_MS };
-    }
-
-    res.json(formsCache.data);
+    res.json(await getCachedEventForms());
   } catch (err) {
     console.error('Failed to fetch event forms:', err);
     res.status(500).json({ error: 'Could not load event list' });
@@ -160,7 +160,194 @@ async function patchReferralProperties(contactId, properties) {
   );
 }
 
+// ─── Event attendance helpers ────────────────────────────────────────────────
+
+function stripEventPrefixServer(name) {
+  return name.replace(/^event\s*-\s*/i, '').trim();
+}
+
+// HubSpot form field internal names → the keys we want in our attendee
+// objects. IMPORTANT: verify these against a real submission for your
+// actual EVENT forms (see "How to verify field names" below) — if your
+// forms use e.g. "mobilephone" instead of "phone", update the key here.
+const SUBMISSION_FIELD_MAP = {
+  firstname: 'firstName',
+  lastname: 'lastName',
+  phone: 'phone',
+  email: 'email',
+  zip: 'postalCode',
+};
+
+function parseSubmissionValues(values) {
+  const parsed = {};
+  for (const { name, value } of values) {
+    const key = SUBMISSION_FIELD_MAP[name];
+    if (key) parsed[key] = value;
+  }
+  return parsed;
+}
+
+async function fetchFormSubmissions(formId) {
+  const results = [];
+  let after = undefined;
+
+  do {
+    const url = new URL(`https://api.hubapi.com/form-integrations/v1/submissions/forms/${formId}`);
+    url.searchParams.set('limit', '50');
+    if (after) url.searchParams.set('after', after);
+
+    const res = await fetch(url, { headers: hubspotHeaders() });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`HubSpot submissions API error ${res.status}: ${errText}`);
+    }
+
+    const json = await res.json();
+    results.push(...json.results);
+    after = json.paging?.next?.after;
+  } while (after);
+
+  return results;
+}
+
+// Cached the same way formsCache is — the option list rarely changes.
+let eventOptionsCache = { data: null, expiresAt: 0 };
+
+async function getEventsAttendedOptions() {
+  const now = Date.now();
+  if (!eventOptionsCache.data || now > eventOptionsCache.expiresAt) {
+    const res = await axios.get(
+      'https://api.hubapi.com/crm/v3/properties/contacts/events_attended',
+      { headers: hubspotHeaders() }
+    );
+    eventOptionsCache = { data: res.data.options, expiresAt: now + CACHE_TTL_MS };
+  }
+  return eventOptionsCache.data;
+}
+
+function findEventOption(eventLabel, options) {
+  return options.find(
+    opt => opt.label.trim().toLowerCase() === eventLabel.trim().toLowerCase()
+  ) || null;
+}
+
 // ─── Routes ──────────────────────────────────────────────────────────────────
+
+app.get('/api/event-forms/:formId/attendees', async (req, res) => {
+  try {
+    const { formId } = req.params;
+
+    const forms = await getCachedEventForms();
+    const form = forms.find(f => f.id === formId);
+    if (!form) return res.status(404).json({ error: 'Event form not found' });
+
+    const eventLabel = stripEventPrefixServer(form.name);
+    const options = await getEventsAttendedOptions();
+    const option = findEventOption(eventLabel, options);
+
+    if (!option) {
+      return res.status(422).json({
+        error: `No "${eventLabel}" option exists on the events_attended property yet. Add it in HubSpot: Settings → Properties → events_attended.`,
+      });
+    }
+
+    // 1. Pull every submission for this form.
+    const submissions = await fetchFormSubmissions(formId);
+    console.log(JSON.stringify(submissions[0], null, 2))
+    const submitters = submissions.map(s => parseSubmissionValues(s.values));
+    const emails = [...new Set(submitters.map(s => s.email).filter(Boolean))];
+
+    if (emails.length === 0) return res.json([]);
+
+    // 2. Batch-resolve all submitters to CRM contacts by email in ONE call
+    //    (instead of one lookup per attendee), pulling their current
+    //    events_attended value so checkboxes reflect real saved state.
+    const batchRes = await axios.post(
+      'https://api.hubapi.com/crm/v3/objects/contacts/batch/read',
+      {
+        idProperty: 'email',
+        inputs: emails.map(email => ({ id: email })),
+        properties: ['email', 'firstname', 'lastname', 'phone', 'zip', 'events_attended'],
+      },
+      { headers: hubspotHeaders() }
+    );
+
+    const contactsByEmail = {};
+    for (const contact of batchRes.data.results) {
+      const email = contact.properties.email?.toLowerCase();
+      if (email) contactsByEmail[email] = contact;
+    }
+
+    // 3. Merge: CRM data wins where a matching contact exists (it's the
+    //    source of truth and may have been corrected since submission);
+    //    fall back to raw submission data otherwise.
+    const attendees = submitters.map(sub => {
+      const contact = sub.email ? contactsByEmail[sub.email.toLowerCase()] : null;
+      const attendedValues = contact?.properties.events_attended?.split(';').filter(Boolean) || [];
+
+      return {
+        contactId: contact?.id || null,
+        firstName: contact?.properties.firstname || sub.firstName || '',
+        lastName: contact?.properties.lastname || sub.lastName || '',
+        phone: contact?.properties.phone || sub.phone || '',
+        email: sub.email || '',
+        postalCode: contact?.properties.zip || sub.postalCode || '',
+        attended: attendedValues.includes(option.value),
+      };
+    });
+
+    res.json(attendees);
+  } catch (err) {
+    console.error('Failed to fetch attendees:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Could not load attendee list' });
+  }
+});
+
+app.post('/api/event-forms/:formId/attendance', async (req, res) => {
+  try {
+    const { formId } = req.params;
+    const { contactId, attended } = req.body;
+
+    if (!contactId || typeof attended !== 'boolean') {
+      return res.status(400).json({ error: 'Missing contactId or attended' });
+    }
+
+    const forms = await getCachedEventForms();
+    const form = forms.find(f => f.id === formId);
+    if (!form) return res.status(404).json({ error: 'Event form not found' });
+
+    const eventLabel = stripEventPrefixServer(form.name);
+    const options = await getEventsAttendedOptions();
+    const option = findEventOption(eventLabel, options);
+    if (!option) {
+      return res.status(422).json({ error: `No matching events_attended option for "${eventLabel}"` });
+    }
+
+    const contactRes = await axios.get(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+      { params: { properties: 'events_attended' }, headers: hubspotHeaders() }
+    );
+
+    const currentValues = new Set(
+      (contactRes.data.properties.events_attended || '').split(';').filter(Boolean)
+    );
+
+    if (attended) currentValues.add(option.value);
+    else currentValues.delete(option.value);
+
+    await axios.patch(
+      `https://api.hubapi.com/crm/v3/objects/contacts/${contactId}`,
+      { properties: { events_attended: [...currentValues].join(';') } },
+      { headers: hubspotHeaders() }
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Failed to update attendance:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Could not update attendance' });
+  }
+});
 
 app.get('/', (req, res) => {
   res.send('Server is running');
