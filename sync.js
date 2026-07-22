@@ -1180,7 +1180,6 @@ async function sendSummaryEmail(summary) {
           ${row('New Donors',           summary.newDonorCount)}
           ${row('Daily Refunds',        `-$${summary.dailyRefundTotal.toFixed(2)} (${summary.dailyRefundCount})`)}
           ${row('Net Daily',            `$${summary.netDaily.toFixed(2)}`)}
-          ${row('Cumulative Total',     `$${summary.newCumulativeTotal.toFixed(2)}`)}
           ${row('Cumulative Donors',    summary.newCumulativeDonors)}
         </tbody>
       </table>
